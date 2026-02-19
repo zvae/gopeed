@@ -338,6 +338,7 @@ func doTrigger[T any](d *Downloader, event ActivationEvent, req *base.Request, c
 					storage:  d.storage,
 					identity: ext.buildIdentity(),
 				}
+				gopeed.File = &ContextFile{}
 				scriptFilePath := filepath.Join(d.ExtensionPath(ext), script.Entry)
 				if _, err = os.Stat(scriptFilePath); os.IsNotExist(err) {
 					gopeed.Logger.logger.Error().Err(err).Msgf("[%s] script file not exist", ext.buildIdentity())
@@ -606,6 +607,53 @@ type Instance struct {
 	Logger   *InstanceLogger `json:"logger"`
 	Settings map[string]any  `json:"settings"`
 	Storage  *ContextStorage `json:"storage"`
+	File     *ContextFile    `json:"file"`
+}
+
+type ContextFile struct {
+}
+
+func (f *ContextFile) Exists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
+}
+
+func (f *ContextFile) Size(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func (f *ContextFile) IsFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func (f *ContextFile) IsDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+func (f *ContextFile) Stat(path string) (map[string]any, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"name":    info.Name(),
+		"size":    info.Size(),
+		"mode":    info.Mode().String(),
+		"modTime": info.ModTime().Unix(),
+		"isDir":   info.IsDir(),
+	}, nil
 }
 
 type InstanceEvents map[ActivationEvent]goja.Callable
@@ -735,6 +783,33 @@ func (t *ExtensionTask) Pause() error {
 	return t.download.Pause(&TaskFilter{
 		IDs: []string{t.ID},
 	})
+}
+
+func (t *ExtensionTask) Delete(force bool) error {
+	return t.download.Delete(&TaskFilter{
+		IDs: []string{t.ID},
+	}, force)
+}
+
+func (t *ExtensionTask) FolderPath() string {
+	if t.Meta == nil || t.Meta.Res == nil {
+		return ""
+	}
+	return t.Meta.FolderPath()
+}
+
+func (t *ExtensionTask) SingleFilepath() string {
+	if t.Meta == nil || t.Meta.Res == nil || len(t.Meta.Res.Files) == 0 {
+		return ""
+	}
+	return t.Meta.SingleFilepath()
+}
+
+func (t *ExtensionTask) RootDirPath() string {
+	if t.Meta == nil {
+		return ""
+	}
+	return t.Meta.RootDirPath()
 }
 
 func parseSettings(settings []*Setting) map[string]any {

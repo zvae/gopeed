@@ -1216,6 +1216,12 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		defer task.lock.Unlock()
 
 		d.triggerOnStart(task)
+
+		// Check if the task was deleted in the onStart event
+		if d.GetTask(task.ID) == nil {
+			return nil
+		}
+
 		if task.Meta.Res == nil {
 			err := task.fetcher.Resolve(task.Meta.Req, task.Meta.Opts)
 			if err != nil {
