@@ -1120,6 +1120,20 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 	task.Progress = &Progress{}
 	_, task.Uploading = f.(fetcher.Uploader)
 	initTask(task)
+
+	func() {
+		d.lock.Lock()
+		defer d.lock.Unlock()
+
+		d.tasks = append(d.tasks, task)
+	}()
+
+	d.triggerOnCreate(task)
+
+	if d.GetTask(task.ID) == nil {
+		return
+	}
+
 	if err = d.storage.Put(bucketTask, task.ID, task.clone()); err != nil {
 		return
 	}
@@ -1128,8 +1142,6 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 	func() {
 		d.lock.Lock()
 		defer d.lock.Unlock()
-
-		d.tasks = append(d.tasks, task)
 
 		remainRunningCount := d.remainRunningCount()
 		if remainRunningCount == 0 {

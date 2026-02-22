@@ -37,6 +37,7 @@ type ActivationEvent string
 
 const (
 	EventOnResolve ActivationEvent = "onResolve"
+	EventOnCreate  ActivationEvent = "onCreate"
 	EventOnStart   ActivationEvent = "onStart"
 	EventOnError   ActivationEvent = "onError"
 	EventOnDone    ActivationEvent = "onDone"
@@ -316,6 +317,18 @@ func (d *Downloader) triggerOnDone(task *Task) {
 			Task: NewExtensionTask(d, task),
 		},
 		nil,
+	)
+}
+
+func (d *Downloader) triggerOnCreate(task *Task) {
+	doTrigger(d,
+		EventOnCreate,
+		task.Meta.Req,
+		&OnCreateContext{
+			Task: NewExtensionTask(d, task),
+		},
+		func(ext *Extension, gopeed *Instance, ctx *OnCreateContext) {
+		},
 	)
 }
 
@@ -678,6 +691,10 @@ func (h InstanceEvents) OnDone(fn goja.Callable) {
 	h.register(EventOnDone, fn)
 }
 
+func (h InstanceEvents) OnCreate(fn goja.Callable) {
+	h.register(EventOnCreate, fn)
+}
+
 type ExtensionInfo struct {
 	Identity string `json:"identity"`
 	Name     string `json:"name"`
@@ -752,6 +769,10 @@ type OnErrorContext struct {
 
 type OnDoneContext struct {
 	Task *Task `json:"task"`
+}
+
+type OnCreateContext struct {
+	Task *ExtensionTask `json:"task"`
 }
 
 // ExtensionTask is a wrapper of Task, it's used to interact with extension scripts.
