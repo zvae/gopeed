@@ -8,8 +8,11 @@ import (
 	"github.com/GopeedLab/gopeed/internal/controller"
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/internal/protocol/bt"
+	"github.com/GopeedLab/gopeed/internal/protocol/ed2k"
+	"github.com/GopeedLab/gopeed/internal/protocol/gblob"
 	"github.com/GopeedLab/gopeed/internal/protocol/http"
 	"github.com/GopeedLab/gopeed/pkg/base"
+	enginewebview "github.com/GopeedLab/gopeed/pkg/download/engine/webview"
 	"github.com/GopeedLab/gopeed/pkg/util"
 	gonanoid "github.com/matoous/go-nanoid/v2"
 )
@@ -110,6 +113,14 @@ func (t *Task) updateUploadSpeed(downloaded int64, usedTime float64) int64 {
 }
 
 func calcSpeed(speedArr *[]int64, downloaded int64, usedTime float64) int64 {
+	if usedTime <= 0 {
+		return 0
+	}
+	if downloaded < 0 {
+		*speedArr = (*speedArr)[:0]
+		return 0
+	}
+
 	*speedArr = append(*speedArr, downloaded)
 	// Record last 5 seconds of download speed to calculate the average speed
 	if len(*speedArr) > int(5.0/usedTime) {
@@ -142,6 +153,7 @@ type DownloaderConfig struct {
 	Storage           Storage
 	StorageDir        string
 	WhiteDownloadDirs []string
+	WebViewProvider   enginewebview.Provider
 
 	ProductionMode bool
 
@@ -154,8 +166,10 @@ func (cfg *DownloaderConfig) Init() *DownloaderConfig {
 	}
 	if len(cfg.FetchManagers) == 0 {
 		cfg.FetchManagers = []fetcher.FetcherManager{
+			new(gblob.FetcherManager),
 			new(http.FetcherManager),
 			new(bt.FetcherManager),
+			new(ed2k.FetcherManager),
 		}
 	}
 	if cfg.RefreshInterval == 0 {

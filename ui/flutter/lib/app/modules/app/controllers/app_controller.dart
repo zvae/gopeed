@@ -4,8 +4,8 @@ import 'dart:io';
 import 'dart:ui';
 
 import 'package:app_links/app_links.dart';
-import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:get/get.dart';
 import 'package:launch_at_startup/launch_at_startup.dart';
@@ -22,7 +22,6 @@ import '../../../../api/model/create_task.dart';
 import '../../../../api/model/downloader_config.dart';
 import '../../../../api/model/install_extension.dart';
 import '../../../../api/model/request.dart';
-import '../../../../api/model/result.dart';
 import '../../../../core/common/start_config.dart';
 import '../../../../core/libgopeed_boot.dart';
 import '../../../../database/database.dart';
@@ -36,8 +35,10 @@ import '../../../../util/package_info.dart';
 import '../../../../util/updater.dart';
 import '../../../../util/util.dart';
 import '../../../routes/app_pages.dart';
-import '../../../rpc/rpc.dart';
+import '../../../rpc/host_rpc_service.dart';
+import '../../../rpc/webview_rpc_service.dart';
 import '../../redirect/views/redirect_view.dart';
+import '../../../services/notification_service.dart';
 
 const unixSocketPath = 'gopeed.sock';
 
@@ -69,6 +70,7 @@ class PendingUpdateTask {
 
 class AppController extends GetxController with WindowListener, TrayListener {
   static StartConfig? _defaultStartConfig;
+  static const _nativeChannel = MethodChannel('gopeed.com/libgopeed');
 
   /// Command line --hidden flag passed from main.dart
   final bool hiddenFromArgs;
@@ -79,6 +81,7 @@ class AppController extends GetxController with WindowListener, TrayListener {
   final startConfig = StartConfig().obs;
   final runningPort = 0.obs;
   final downloaderConfig = DownloaderConfig().obs;
+  var androidDialogMode = false;
 
   /// The task that is pending URL update via listen mode.
   /// Stored here in AppController to persist across page navigations.
@@ -96,6 +99,10 @@ class AppController extends GetxController with WindowListener, TrayListener {
 
     _initWindows().onError((error, stackTrace) =>
         logger.w("initWindows error", error, stackTrace));
+
+    if (Util.isDesktop()) {
+      Get.put(NotificationService());
+    }
 
     _initTray().onError(
         (error, stackTrace) => logger.w("initTray error", error, stackTrace));
@@ -120,7 +127,11 @@ class AppController extends GetxController with WindowListener, TrayListener {
   void onClose() {
     _linkSubscription?.cancel();
     trayManager.removeListener(this);
-    LibgopeedBoot.instance.stop();
+    if (!androidDialogMode) {
+      HostRpcService.instance.stop();
+      WebViewRpcService.instance.stop();
+      LibgopeedBoot.instance.stop();
+    }
   }
 
   @override
@@ -176,6 +187,7 @@ class AppController extends GetxController with WindowListener, TrayListener {
       // For web, just show window
       return;
     }
+    androidDialogMode = await _isAndroidDialogMode();
 
     // Handle deep link
     _appLinks = AppLinks();
@@ -235,6 +247,18 @@ class AppController extends GetxController with WindowListener, TrayListener {
     }
   }
 
+  Future<bool> _isAndroidDialogMode() async {
+    if (!Util.isAndroid()) {
+      return false;
+    }
+    try {
+      return await _nativeChannel.invokeMethod<bool>('isDialogMode') ?? false;
+    } catch (e) {
+      logger.w("get android dialog mode fail", e);
+      return false;
+    }
+  }
+
   Future<void> _initWindows() async {
     if (!Util.isDesktop()) {
       return;
@@ -291,7 +315,7 @@ class AppController extends GetxController with WindowListener, TrayListener {
       MenuItem(
         label: 'donate'.tr,
         onClick: (menuItem) => {
-          launchUrl(Uri.parse("https://docs.gopeed.com/donate.html"),
+          launchUrl(Uri.parse("https://gopeed.com/docs/donate"),
               mode: LaunchMode.externalApplication)
         },
       ),
@@ -324,54 +348,33 @@ class AppController extends GetxController with WindowListener, TrayListener {
       return;
     }
     try {
-      await startRpcServer({
-        "/create": (ctx) async {
-          final meta =
-              ctx.request.headers["X-Gopeed-Host-Meta"]?.firstOrNull ?? "{}";
-          final jsonMeta = jsonDecode(meta);
-          final silent = jsonMeta['silent'] as bool? ?? false;
-          final params = await ctx.readText();
-          final createTaskParams = CreateTask.fromJson(_decodeParams(params));
+      await HostRpcService.instance.start(
+        onCreate: (createTaskParams, silent) async {
           if (!silent || pendingUpdateTask.value != null) {
             await windowManager.show();
             _handleToCreate0(createTaskParams);
-          } else {
-            try {
-              await createTask(createTaskParams);
-            } catch (e) {
-              logger.w(
-                  "create task from extension fail", e, StackTrace.current);
-            }
+            return;
           }
-        },
-        "/forward": (ctx) async {
           try {
-            final body = await ctx.readJSON();
-            final method = (body['method'] as String?)?.toUpperCase() ?? 'GET';
-            final path = (body['path'] as String?) ?? "/";
-            final data = body['data'];
-            final query = body['query'] as Map<String, dynamic>?;
-
-            // Forward request to gopeed REST API
-            final response = await forward(
-              path,
-              method: method,
-              data: data,
-              queryParameters: query,
-            );
-
-            // Return raw response
-            await ctx.writeJSON(response.data);
+            await createTask(createTaskParams);
           } catch (e) {
-            if (e is DioException && e.response != null) {
-              // Return API error response
-              await ctx.writeJSON(e.response!.data);
-            } else {
-              await ctx.writeJSON(Result(code: 1, msg: e.toString()).toJson());
-            }
+            logger.w("create task from extension fail", e, StackTrace.current);
           }
         },
-      });
+        onForward: ({
+          required String path,
+          required String method,
+          data,
+          Map<String, dynamic>? query,
+        }) {
+          return forward(
+            path,
+            method: method,
+            data: data,
+            queryParameters: query,
+          );
+        },
+      );
     } catch (e) {
       logger.w("start rpc server fail", e, StackTrace.current);
     }
@@ -455,9 +458,7 @@ class AppController extends GetxController with WindowListener, TrayListener {
     } else {
       path = (await toFile(uri.toString())).path;
     }
-    Get.rootDelegate.offAndToNamed(Routes.REDIRECT,
-        arguments: RedirectArgs(Routes.CREATE,
-            arguments: CreateTask(req: Request(url: path))));
+    _handleToCreate0(CreateTask(req: Request(url: path)));
   }
 
   String runningAddress() {
@@ -712,8 +713,10 @@ class AppController extends GetxController with WindowListener, TrayListener {
   }
 
   _handleToCreate0(CreateTask createTaskParams) {
+    final targetRoute =
+        androidDialogMode ? Routes.QUICK_CREATE : Routes.CREATE;
     Get.rootDelegate.offAndToNamed(Routes.REDIRECT,
-        arguments: RedirectArgs(Routes.CREATE, arguments: createTaskParams));
+        arguments: RedirectArgs(targetRoute, arguments: createTaskParams));
   }
 
   _handleToExtension(String params) {

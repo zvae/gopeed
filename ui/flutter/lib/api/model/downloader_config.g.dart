@@ -19,8 +19,7 @@ DownloaderConfig _$DownloaderConfigFromJson(Map<String, dynamic> json) =>
       ..proxy = ProxyConfig.fromJson(json['proxy'] as Map<String, dynamic>)
       ..webhook =
           WebhookConfig.fromJson(json['webhook'] as Map<String, dynamic>?)
-      ..script =
-          ScriptConfig.fromJson(json['script'] as Map<String, dynamic>?)
+      ..script = ScriptConfig.fromJson(json['script'] as Map<String, dynamic>?)
       ..autoTorrent = AutoTorrentConfig.fromJson(
           json['autoTorrent'] as Map<String, dynamic>?)
       ..archive =
@@ -43,12 +42,15 @@ Map<String, dynamic> _$DownloaderConfigToJson(DownloaderConfig instance) =>
 ProtocolConfig _$ProtocolConfigFromJson(Map<String, dynamic> json) =>
     ProtocolConfig()
       ..http = HttpConfig.fromJson(json['http'] as Map<String, dynamic>)
-      ..bt = BtConfig.fromJson(json['bt'] as Map<String, dynamic>);
+      ..bt = BtConfig.fromJson(json['bt'] as Map<String, dynamic>)
+      ..ed2k = Ed2kConfig.fromJson(
+          json['ed2k'] as Map<String, dynamic>? ?? <String, dynamic>{});
 
 Map<String, dynamic> _$ProtocolConfigToJson(ProtocolConfig instance) =>
     <String, dynamic>{
       'http': instance.http.toJson(),
       'bt': instance.bt.toJson(),
+      'ed2k': instance.ed2k.toJson(),
     };
 
 HttpConfig _$HttpConfigFromJson(Map<String, dynamic> json) => HttpConfig(
@@ -83,6 +85,23 @@ Map<String, dynamic> _$BtConfigToJson(BtConfig instance) => <String, dynamic>{
       'seedTime': instance.seedTime,
     };
 
+Ed2kConfig _$Ed2kConfigFromJson(Map<String, dynamic> json) => Ed2kConfig(
+      listenPort: (json['listenPort'] as num?)?.toInt() ?? 0,
+      udpPort: (json['udpPort'] as num?)?.toInt() ?? 0,
+      serverAddr: json['serverAddr'] as String? ?? '',
+      serverMet: json['serverMet'] as String? ?? '',
+      nodesDat: json['nodesDat'] as String? ?? '',
+    );
+
+Map<String, dynamic> _$Ed2kConfigToJson(Ed2kConfig instance) =>
+    <String, dynamic>{
+      'listenPort': instance.listenPort,
+      'udpPort': instance.udpPort,
+      'serverAddr': instance.serverAddr,
+      'serverMet': instance.serverMet,
+      'nodesDat': instance.nodesDat,
+    };
+
 ExtraConfig _$ExtraConfigFromJson(Map<String, dynamic> json) => ExtraConfig(
       themeMode: json['themeMode'] as String? ?? '',
       locale: json['locale'] as String? ?? '',
@@ -91,6 +110,7 @@ ExtraConfig _$ExtraConfigFromJson(Map<String, dynamic> json) => ExtraConfig(
       defaultBtClient: json['defaultBtClient'] as bool? ?? true,
       notifyWhenNewVersion: json['notifyWhenNewVersion'] as bool? ?? true,
       autoStartTasks: json['autoStartTasks'] as bool? ?? false,
+      desktopNotification: json['desktopNotification'] as bool? ?? true,
       downloadCategories: (json['downloadCategories'] as List<dynamic>?)
               ?.map((e) => DownloadCategory.fromJson(e as Map<String, dynamic>))
               .toList() ??
@@ -109,6 +129,7 @@ Map<String, dynamic> _$ExtraConfigToJson(ExtraConfig instance) =>
       'defaultBtClient': instance.defaultBtClient,
       'notifyWhenNewVersion': instance.notifyWhenNewVersion,
       'autoStartTasks': instance.autoStartTasks,
+      'desktopNotification': instance.desktopNotification,
       'downloadCategories':
           instance.downloadCategories.map((e) => e.toJson()).toList(),
       'bt': instance.bt.toJson(),
@@ -156,8 +177,7 @@ Map<String, dynamic> _$WebhookConfigToJson(WebhookConfig instance) =>
       'urls': instance.urls,
     };
 
-ScriptConfig _$ScriptConfigFromJson(Map<String, dynamic> json) =>
-    ScriptConfig(
+ScriptConfig _$ScriptConfigFromJson(Map<String, dynamic> json) => ScriptConfig(
       enable: json['enable'] as bool? ?? false,
       paths:
           (json['paths'] as List<dynamic>?)?.map((e) => e as String).toList() ??
