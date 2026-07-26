@@ -3,6 +3,7 @@ package download
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GopeedLab/gopeed/internal/controller"
@@ -34,8 +35,56 @@ type Task struct {
 	timer          *util.Timer
 	statusLock     *sync.Mutex
 	lock           *sync.Mutex
+	// persistLock guards storage writes and deletes of this task, so that a write
+	// issued by a background goroutine can't land after the task has been deleted
+	// and resurrect it on the next startup.
+	persistLock *sync.Mutex
+	// deleted is set when the task has been removed, once set the task must never
+	// be written back to storage again.
+	deleted *atomic.Bool
+	// creating is set while the task is still inside doCreate. It's already visible
+	// in the task list so that extensions can delete it from the onCreate event,
+	// but it isn't owned by the pause/continue flows yet.
+	creating *atomic.Bool
+	// started reports whether doStart has run for this task in the current process.
+	started bool
+	// resumable reports whether the fetcher was restored from persisted progress,
+	// which means the task already owns the file it is going to write to.
+	resumable      bool
 	speedArr       []int64
 	uploadSpeedArr []int64
+}
+
+// markDeleted flags the task as deleted, see Task.deleted.
+func (t *Task) markDeleted() {
+	if t.deleted != nil {
+		t.deleted.Store(true)
+	}
+}
+
+func (t *Task) isDeleted() bool {
+	return t.deleted != nil && t.deleted.Load()
+}
+
+func (t *Task) markCreating(creating bool) {
+	if t.creating != nil {
+		t.creating.Store(creating)
+	}
+}
+
+func (t *Task) isCreating() bool {
+	return t.creating != nil && t.creating.Load()
+}
+
+// lockPersist locks the task against concurrent storage writes and returns the unlock
+// function. Tasks built outside initTask (e.g. in tests) have no lock, unlocking such
+// a task is a no-op.
+func (t *Task) lockPersist() func() {
+	if t.persistLock == nil {
+		return func() {}
+	}
+	t.persistLock.Lock()
+	return t.persistLock.Unlock
 }
 
 func NewTask() *Task {
