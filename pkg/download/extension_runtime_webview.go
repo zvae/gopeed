@@ -28,6 +28,9 @@ func injectGopeed(vm *goja.Runtime, gopeed *Instance) error {
 	if err := gopeedObject.Set("storage", gopeed.Storage); err != nil {
 		return err
 	}
+	if err := gopeedObject.Set("file", gopeed.File); err != nil {
+		return err
+	}
 	runtimeObject := vm.NewObject()
 	if gopeed.Runtime != nil {
 		if err := runtimeObject.Set("blob", newJSBlobRuntime(vm)); err != nil {
@@ -87,6 +90,9 @@ func newJSEventsRuntime(vm *goja.Runtime, events InstanceEvents) *goja.Object {
 	}
 	_ = obj.Set("onResolve", func(call goja.FunctionCall) goja.Value {
 		return register(EventOnResolve, call)
+	})
+	_ = obj.Set("onCreate", func(call goja.FunctionCall) goja.Value {
+		return register(EventOnCreate, call)
 	})
 	_ = obj.Set("onStart", func(call goja.FunctionCall) goja.Value {
 		return register(EventOnStart, call)
