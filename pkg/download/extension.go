@@ -16,6 +16,7 @@ import (
 	"github.com/GopeedLab/gopeed/pkg/download/engine"
 	gojaerror "github.com/GopeedLab/gopeed/pkg/download/engine/inject/error"
 	gojautil "github.com/GopeedLab/gopeed/pkg/download/engine/util"
+	enginewebview "github.com/GopeedLab/gopeed/pkg/download/engine/webview"
 	"github.com/GopeedLab/gopeed/pkg/util"
 	"github.com/dop251/goja"
 	"github.com/go-git/go-git/v5"
@@ -269,6 +270,7 @@ func (d *Downloader) triggerOnResolve(req *base.Request) (res *base.Resource, er
 				for _, file := range ctx.Res.Files {
 					file.Name = util.SafeFilename(file.Name)
 				}
+				ensureResourceRequestRawURLs(req, ctx.Res)
 				ctx.Res.CalcSize(nil)
 			}
 			res = ctx.Res
@@ -282,7 +284,7 @@ func (d *Downloader) triggerOnStart(task *Task) {
 		EventOnStart,
 		task.Meta.Req,
 		&OnStartContext{
-			Task: NewExtensionTask(d, task),
+			Task: newOnStartExtensionTask(task),
 		},
 		func(ext *Extension, gopeed *Instance, ctx *OnStartContext) {
 			// Validate request structure
@@ -294,7 +296,6 @@ func (d *Downloader) triggerOnStart(task *Task) {
 			}
 		},
 	)
-	return
 }
 
 func (d *Downloader) triggerOnError(task *Task, err error) {
@@ -302,7 +303,7 @@ func (d *Downloader) triggerOnError(task *Task, err error) {
 		EventOnError,
 		task.Meta.Req,
 		&OnErrorContext{
-			Task:  NewExtensionTask(d, task),
+			Task:  newOnErrorExtensionTask(d, task),
 			Error: err,
 		},
 		nil,
@@ -313,8 +314,8 @@ func (d *Downloader) triggerOnDone(task *Task) {
 	doTrigger(d,
 		EventOnDone,
 		task.Meta.Req,
-		&OnErrorContext{
-			Task: NewExtensionTask(d, task),
+		&OnDoneContext{
+			Task: newOnDoneExtensionTask(task),
 		},
 		nil,
 	)
@@ -325,10 +326,9 @@ func (d *Downloader) triggerOnCreate(task *Task) {
 		EventOnCreate,
 		task.Meta.Req,
 		&OnCreateContext{
-			Task: NewExtensionTask(d, task),
+			Task: newOnCreateExtensionTask(d, task),
 		},
-		func(ext *Extension, gopeed *Instance, ctx *OnCreateContext) {
-		},
+		nil,
 	)
 }
 
@@ -375,11 +375,12 @@ func doTrigger[T any](d *Downloader, event ActivationEvent, req *base.Request, c
 					if req.Labels == nil {
 						req.Labels = make(map[string]string)
 					}
-					engine := engine.NewEngine(&engine.Config{
-						ProxyConfig: d.cfg.Proxy,
-					})
-					defer engine.Close()
-					err = engine.Runtime.Set("gopeed", gopeed)
+					engine, session := d.newExtensionEngine()
+					defer session.CloseIfIdle()
+					gopeed.Runtime = &InstanceRuntime{
+						WebView: d.newExtensionWebViewRuntime(session),
+					}
+					err = injectGopeed(engine.Runtime, gopeed)
 					if err != nil {
 						gopeed.Logger.logger.Error().Err(err).Msgf("[%s] engine inject failed", ext.buildIdentity())
 						return
@@ -565,8 +566,12 @@ func (s *Script) match(event ActivationEvent, req *base.Request) bool {
 	}
 
 	// match url
+	targetURL := req.RawURL
+	if targetURL == "" {
+		targetURL = req.URL
+	}
 	for _, url := range s.Match.Urls {
-		if util.Match(url, req.URL) {
+		if util.Match(url, targetURL) {
 			return true
 		}
 	}
@@ -615,12 +620,13 @@ type Option struct {
 
 // Instance inject to js context when extension script is activated
 type Instance struct {
-	Events   InstanceEvents  `json:"events"`
-	Info     *ExtensionInfo  `json:"info"`
-	Logger   *InstanceLogger `json:"logger"`
-	Settings map[string]any  `json:"settings"`
-	Storage  *ContextStorage `json:"storage"`
-	File     *ContextFile    `json:"file"`
+	Events   InstanceEvents   `json:"events"`
+	Info     *ExtensionInfo   `json:"info"`
+	Logger   *InstanceLogger  `json:"logger"`
+	Settings map[string]any   `json:"settings"`
+	Storage  *ContextStorage  `json:"storage"`
+	File     *ContextFile     `json:"file"`
+	Runtime  *InstanceRuntime `json:"runtime"`
 }
 
 type ContextFile struct {
@@ -669,29 +675,33 @@ func (f *ContextFile) Stat(path string) (map[string]any, error) {
 	}, nil
 }
 
-type InstanceEvents map[ActivationEvent]goja.Callable
+type InstanceRuntime struct {
+	WebView *enginewebview.Runtime `json:"webview"`
+}
 
-func (h InstanceEvents) register(name ActivationEvent, fn goja.Callable) {
+type InstanceEvents map[ActivationEvent]engine.JSFunction
+
+func (h InstanceEvents) register(name ActivationEvent, fn engine.JSFunction) {
 	h[name] = fn
 }
 
-func (h InstanceEvents) OnResolve(fn goja.Callable) {
+func (h InstanceEvents) OnResolve(fn engine.JSFunction) {
 	h.register(EventOnResolve, fn)
 }
 
-func (h InstanceEvents) OnStart(fn goja.Callable) {
+func (h InstanceEvents) OnStart(fn engine.JSFunction) {
 	h.register(EventOnStart, fn)
 }
 
-func (h InstanceEvents) OnError(fn goja.Callable) {
+func (h InstanceEvents) OnError(fn engine.JSFunction) {
 	h.register(EventOnError, fn)
 }
 
-func (h InstanceEvents) OnDone(fn goja.Callable) {
+func (h InstanceEvents) OnDone(fn engine.JSFunction) {
 	h.register(EventOnDone, fn)
 }
 
-func (h InstanceEvents) OnCreate(fn goja.Callable) {
+func (h InstanceEvents) OnCreate(fn engine.JSFunction) {
 	h.register(EventOnCreate, fn)
 }
 
@@ -763,8 +773,8 @@ type OnStartContext struct {
 }
 
 type OnErrorContext struct {
-	Task  *ExtensionTask `json:"task"`
-	Error error          `json:"error"`
+	Task  *OnErrorExtensionTask `json:"task"`
+	Error error                 `json:"error"`
 }
 
 type OnDoneContext struct {
@@ -772,41 +782,77 @@ type OnDoneContext struct {
 }
 
 type OnCreateContext struct {
-	Task *ExtensionTask `json:"task"`
+	Task *OnCreateExtensionTask `json:"task"`
 }
 
 // ExtensionTask is a wrapper of Task, it's used to interact with extension scripts.
 // Avoid extension scripts modifying task directly, use ExtensionTask to encapsulate task,
 // only some fields can be modified, such as request info.
 type ExtensionTask struct {
-	download *Downloader
-
 	*Task
 }
 
-func NewExtensionTask(download *Downloader, task *Task) *ExtensionTask {
-	// restricts extension scripts to only modify request info
+// OnErrorExtensionTask adds error-recovery controls to ExtensionTask.
+// Continue is intentionally only exposed to onError handlers.
+type OnErrorExtensionTask struct {
+	download *Downloader
+
+	*ExtensionTask
+}
+
+// OnCreateExtensionTask adds task-removal control to ExtensionTask.
+// Delete is intentionally only exposed to onCreate handlers, so an extension can
+// discard a task before it starts downloading (e.g. the file already exists locally).
+type OnCreateExtensionTask struct {
+	download *Downloader
+
+	*ExtensionTask
+}
+
+func cloneExtensionTask(task *Task) *Task {
 	newTask := task.clone()
 	newTask.Meta.Req = task.Meta.Req
-	return &ExtensionTask{
-		download: download,
-		Task:     newTask,
+	return newTask
+}
+
+func newExtensionTask(task *Task) *ExtensionTask {
+	return &ExtensionTask{Task: cloneExtensionTask(task)}
+}
+
+func newOnStartExtensionTask(task *Task) *ExtensionTask {
+	return newExtensionTask(task)
+}
+
+func newOnErrorExtensionTask(download *Downloader, task *Task) *OnErrorExtensionTask {
+	return &OnErrorExtensionTask{
+		download:      download,
+		ExtensionTask: newExtensionTask(task),
 	}
 }
 
-func (t *ExtensionTask) Continue() error {
+func newOnCreateExtensionTask(download *Downloader, task *Task) *OnCreateExtensionTask {
+	return &OnCreateExtensionTask{
+		download:      download,
+		ExtensionTask: newExtensionTask(task),
+	}
+}
+
+func newOnDoneExtensionTask(task *Task) *Task {
+	return cloneExtensionTask(task)
+}
+
+// SetUrl replaces the task request URL.
+func (t *ExtensionTask) SetUrl(url string) {
+	t.Meta.Req.URL = url
+}
+
+func (t *OnErrorExtensionTask) Continue() error {
 	return t.download.Continue(&TaskFilter{
 		IDs: []string{t.ID},
 	})
 }
 
-func (t *ExtensionTask) Pause() error {
-	return t.download.Pause(&TaskFilter{
-		IDs: []string{t.ID},
-	})
-}
-
-func (t *ExtensionTask) Delete(force bool) error {
+func (t *OnCreateExtensionTask) Delete(force bool) error {
 	return t.download.Delete(&TaskFilter{
 		IDs: []string{t.ID},
 	}, force)

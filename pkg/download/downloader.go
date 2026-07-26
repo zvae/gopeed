@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	internalblob "github.com/GopeedLab/gopeed/internal/blob"
 	"github.com/GopeedLab/gopeed/internal/controller"
 	"github.com/GopeedLab/gopeed/internal/fetcher"
 	"github.com/GopeedLab/gopeed/internal/logger"
@@ -31,6 +32,8 @@ const (
 	bucketTask = "task"
 	// task download data bucket
 	bucketSave = "save"
+	// protocol-level shared client state bucket
+	bucketProtocolState = "protocol_state"
 	// downloader config bucket
 	bucketConfig = "config"
 	// downloader extension bucket
@@ -112,6 +115,7 @@ type Downloader struct {
 	claimedExtractions sync.Map
 
 	extensions []*Extension
+	blob       *internalblob.Registry
 }
 
 func NewDownloader(cfg *DownloaderConfig) *Downloader {
@@ -143,8 +147,10 @@ func NewDownloader(cfg *DownloaderConfig) *Downloader {
 }
 
 func (d *Downloader) Setup() error {
+	d.blob = internalblob.NewRegistry("")
+
 	// setup storage
-	if err := d.storage.Setup([]string{bucketTask, bucketSave, bucketConfig, bucketExtension, bucketExtensionStorage}); err != nil {
+	if err := d.storage.Setup([]string{bucketTask, bucketSave, bucketProtocolState, bucketConfig, bucketExtension, bucketExtensionStorage}); err != nil {
 		return err
 	}
 	// load config from storage
@@ -167,6 +173,12 @@ func (d *Downloader) Setup() error {
 		protocol := fm.Name()
 		if _, ok := d.cfg.DownloaderStoreConfig.ProtocolConfig[protocol]; !ok {
 			d.cfg.DownloaderStoreConfig.ProtocolConfig[protocol] = fm.DefaultConfig()
+		}
+		if sfm, ok := fm.(fetcher.StatefulFetcherManager); ok {
+			sfm.SetStateStore(&protocolStateStore{
+				storage:  d.storage,
+				protocol: protocol,
+			})
 		}
 	}
 
@@ -239,12 +251,13 @@ func (d *Downloader) Setup() error {
 			for _, task := range d.GetTasks() {
 				func() {
 					task.statusLock.Lock()
-					defer task.statusLock.Unlock()
 					if task.Status != base.DownloadStatusRunning && !task.Uploading {
+						task.statusLock.Unlock()
 						return
 					}
 					// check if task is deleted
 					if task.isDeleted() || task.fetcher == nil {
+						task.statusLock.Unlock()
 						return
 					}
 
@@ -266,6 +279,8 @@ func (d *Downloader) Setup() error {
 						task.Progress.UploadSpeed = task.updateUploadSpeed(currentUploaded-task.Progress.Uploaded, tick)
 						task.Progress.Uploaded = currentUploaded
 					}
+					task.statusLock.Unlock()
+					// Listener callbacks may Pause/Continue and acquire statusLock.
 					d.emit(EventKeyProgress, task)
 
 					// store fetcher progress when download/upload data changed
@@ -344,6 +359,12 @@ func (d *Downloader) setupFetcher(fm fetcher.FetcherManager, fetcher fetcher.Fet
 	}
 	// Get proxy config, task request proxy config has higher priority, then use global proxy config
 	ctl.GetProxy = func(requestProxy *base.RequestProxy) func(*gohttp.Request) (*url.URL, error) {
+		// Registry-backed blob URLs are loopback capability URLs and must never be
+		// sent through a configured proxy. Only exact, currently registered URLs
+		// take this path; everything else keeps normal HTTP proxy behavior.
+		if d.blob != nil && fetcher != nil && fetcher.Meta() != nil && fetcher.Meta().Req != nil && d.blob.IsURL(fetcher.Meta().Req.URL) {
+			return nil
+		}
 		if requestProxy == nil {
 			return d.cfg.Proxy.ToHandler()
 		}
@@ -385,9 +406,16 @@ func (d *Downloader) saveTask(task *Task) error {
 	if task.isDeleted() {
 		return nil
 	}
-	if err := d.storage.Put(bucketSave, task.ID, data); err != nil {
-		d.Logger.Error().Stack().Err(err).Msgf("persist fetcher failed: %s", task.ID)
-		return err
+	if data != nil {
+		if err := d.storage.Put(bucketSave, task.ID, data); err != nil {
+			d.Logger.Error().Stack().Err(err).Msgf("persist fetcher failed: %s", task.ID)
+			return err
+		}
+	} else {
+		if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+			d.Logger.Error().Stack().Err(err).Msgf("clear fetcher state failed: %s", task.ID)
+			return err
+		}
 	}
 	if err := d.storage.Put(bucketTask, task.ID, task.clone()); err != nil {
 		d.Logger.Error().Stack().Err(err).Msgf("persist task failed: %s", task.ID)
@@ -396,11 +424,36 @@ func (d *Downloader) saveTask(task *Task) error {
 	return nil
 }
 
+func ensureRequestRawURL(req *base.Request) {
+	if req == nil {
+		return
+	}
+	if req.RawURL == "" {
+		req.RawURL = req.URL
+	}
+}
+
+func ensureResourceRequestRawURLs(parentReq *base.Request, res *base.Resource) {
+	if res == nil {
+		return
+	}
+	for _, file := range res.Files {
+		if file == nil || file.Req == nil {
+			continue
+		}
+		ensureRequestRawURL(file.Req)
+		if parentReq != nil && parentReq.RawURL != "" && file.Req.RawURL == file.Req.URL {
+			file.Req.RawURL = parentReq.RawURL
+		}
+	}
+}
+
 func (d *Downloader) Resolve(req *base.Request, opts *base.Options) (rr *ResolveResult, err error) {
 	rrId, err := gonanoid.New()
 	if err != nil {
 		return
 	}
+	ensureRequestRawURL(req)
 
 	res, err := d.triggerOnResolve(req)
 	if err != nil {
@@ -463,6 +516,7 @@ func (d *Downloader) remainRunningCount() int {
 }
 
 func (d *Downloader) CreateDirect(req *base.Request, opts *base.Options) (taskId string, err error) {
+	ensureRequestRawURL(req)
 	var fetcher fetcher.Fetcher
 	fetcher, err = d.buildFetcher(req.URL)
 	if err != nil {
@@ -515,34 +569,40 @@ func (d *Downloader) Patch(id string, req *base.Request, opts *base.Options) err
 	if task == nil {
 		return ErrTaskNotFound
 	}
+	if err := func() error {
+		task.lock.Lock()
+		defer task.lock.Unlock()
 
-	// Restore fetcher if not loaded
-	if task.fetcher == nil {
-		err := func() error {
-			task.statusLock.Lock()
-			defer task.statusLock.Unlock()
+		// Restore fetcher if not loaded
+		if task.fetcher == nil {
+			err := func() error {
+				task.statusLock.Lock()
+				defer task.statusLock.Unlock()
 
-			return d.restoreFetcher(task)
-		}()
-		if err != nil {
+				return d.restoreFetcher(task)
+			}()
+			if err != nil {
+				return err
+			}
+		}
+
+		// Call the fetcher's Patch method
+		if err := task.fetcher.Patch(req, opts); err != nil {
 			return err
 		}
-	}
 
-	// Call the fetcher's Patch method
-	if err := task.fetcher.Patch(req, opts); err != nil {
+		// Update task meta from fetcher and transfer any live Blob lease.
+		task.Meta = task.fetcher.Meta()
+		if err := d.syncBlobTaskLease(task); err != nil {
+			return err
+		}
+
+		return d.saveTask(task)
+	}(); err != nil {
 		return err
 	}
 
-	// Update task meta from fetcher
-	task.Meta = task.fetcher.Meta()
-
-	// Save task to storage
-	if err := d.saveTask(task); err != nil {
-		return err
-	}
-
-	// Emit progress event to notify listeners
+	// Emit outside task.lock so listeners may safely call back into Patch/Pause.
 	d.emit(EventKeyProgress, task)
 
 	return nil
@@ -607,6 +667,7 @@ func (d *Downloader) Continue(filter *TaskFilter) (err error) {
 	}
 
 	realContinueTasks := make([]*Task, 0)
+	pausedTasks := make([]*Task, 0)
 	func() {
 		d.lock.Lock()
 		defer d.lock.Unlock()
@@ -619,12 +680,16 @@ func (d *Downloader) Continue(filter *TaskFilter) (err error) {
 			pausedCount := 0
 			for _, task := range d.tasks {
 				if task.Status == base.DownloadStatusRunning {
-					if err = d.doPause(task); err != nil {
+					var queued bool
+					queued, err = d.doPauseForScheduling(task)
+					if err != nil {
 						return
 					}
-					d.setStatus(task, base.DownloadStatusWait)
-					d.waitTasks = append(d.waitTasks, task)
-					pausedCount++
+					if queued {
+						d.waitTasks = append(d.waitTasks, task)
+						pausedTasks = append(pausedTasks, task)
+						pausedCount++
+					}
 				}
 				if pausedCount == needPauseCount {
 					break
@@ -641,6 +706,14 @@ func (d *Downloader) Continue(filter *TaskFilter) (err error) {
 			}
 		}
 	}()
+	if err != nil {
+		return
+	}
+	// Scheduling pauses run while d.lock is held, but events must not: listeners
+	// are allowed to call back into Downloader methods that acquire d.lock.
+	for _, task := range pausedTasks {
+		d.emit(EventKeyPause, task)
+	}
 
 	for _, task := range realContinueTasks {
 		if err = d.doStart(task); err != nil {
@@ -788,6 +861,7 @@ func (d *Downloader) Stats(id string) (sr any, err error) {
 }
 
 func (d *Downloader) doDelete(task *Task, force bool) (err error) {
+	defer d.releaseBlobTask(task)
 	err = func() error {
 		// Flag the task as deleted and purge it from storage atomically, so that a
 		// concurrent putTask/saveTask either happens fully before the purge or is
@@ -845,6 +919,9 @@ func (d *Downloader) Close() error {
 	for _, fm := range d.cfg.FetchManagers {
 		closeArr = append(closeArr, fm.Close)
 	}
+	if d.blob != nil {
+		closeArr = append(closeArr, d.blob.Close)
+	}
 	closeArr = append(closeArr, d.storage.Close)
 	// Make sure all resources are released, if had error, return the last error
 	var lastErr error
@@ -883,6 +960,26 @@ func (d *Downloader) Clear() error {
 		return err
 	}
 	return nil
+}
+
+type protocolStateStore struct {
+	storage  Storage
+	protocol string
+}
+
+func (s *protocolStateStore) Load(v any) (bool, error) {
+	return s.storage.Get(bucketProtocolState, s.protocol, v)
+}
+
+func (s *protocolStateStore) Save(v any) error {
+	if v == nil {
+		return s.Delete()
+	}
+	return s.storage.Put(bucketProtocolState, s.protocol, v)
+}
+
+func (s *protocolStateStore) Delete() error {
+	return s.storage.Delete(bucketProtocolState, s.protocol)
 }
 
 func (d *Downloader) Listener(fn Listener) {
@@ -1012,7 +1109,6 @@ func (d *Downloader) watch(task *Task) {
 	if _, loaded := d.watchedTasks.LoadOrStore(task.ID, true); loaded {
 		return
 	}
-
 	defer func() {
 		d.watchedTasks.Delete(task.ID)
 	}()
@@ -1035,28 +1131,46 @@ func (d *Downloader) watch(task *Task) {
 		}
 	}
 
-	// watch is spawned from restoreTask while the status is being updated, read it
-	// under the status lock instead of racing with doStart.
-	done, _ := d.statusMut(task, func() (bool, error) {
-		return task.Status == base.DownloadStatusDone, nil
-	})
-	if done {
+	if d.taskStatus(task) == base.DownloadStatusDone {
 		return
 	}
 
-	err := task.fetcher.Wait()
-	if err != nil {
-		d.doOnError(task, err)
-		return
-	}
+	for {
+		err := task.fetcher.Wait()
+		if err != nil {
+			status := d.taskStatus(task)
+			if status == base.DownloadStatusPause || status == base.DownloadStatusWait {
+				return
+			}
+			var sourceErr error
+			if d.blob != nil && task.Meta != nil && task.Meta.Req != nil {
+				sourceErr = d.blob.SourceError(task.Meta.Req.URL)
+			}
+			if sourceErr != nil {
+				d.doOnBlobSourceError(task, sourceErr)
+			} else {
+				d.doOnError(task, err)
+			}
+			if d.taskStatus(task) == base.DownloadStatusRunning {
+				continue
+			}
+			return
+		}
 
-	// When delete a not resolved task, need check if the task resource is nil
-	if task.Meta.Res == nil || task.isDeleted() || d.GetTask(task.ID) == nil {
-		return
-	}
+		// When delete a not resolved task, need check if the task resource is nil
+		if task.Meta.Res == nil || task.isDeleted() || d.GetTask(task.ID) == nil {
+			return
+		}
+		if d.blob != nil && task.Meta.Req != nil {
+			if err := d.blob.SourceError(task.Meta.Req.URL); err != nil {
+				d.doOnBlobSourceError(task, err)
+				if d.taskStatus(task) == base.DownloadStatusRunning {
+					continue
+				}
+				return
+			}
+		}
 
-	// The progress ticker reads and writes these fields under the status lock.
-	d.statusMut(task, func() (bool, error) {
 		task.Progress.Used = task.timer.Used()
 		if task.Meta.Res.Size == 0 {
 			task.Meta.Res.Size = task.fetcher.Progress().TotalDownloaded()
@@ -1068,85 +1182,160 @@ func (d *Downloader) watch(task *Task) {
 		totalSize := task.Meta.Res.Size
 		task.Progress.Speed = totalSize / used
 		task.Progress.Downloaded = totalSize
-		task.updateStatus(base.DownloadStatusDone)
-		return false, nil
-	})
-	d.putTask(task)
-	d.emit(EventKeyDone, task)
-	d.emit(EventKeyFinally, task, err)
-	d.notifyRunning()
-	d.triggerOnDone(task)
-	d.triggerWebhooks(WebhookEventDownloadDone, task, nil)
-	d.triggerScripts(ScriptEventDownloadDone, task, nil)
-
-	if e, ok := task.Meta.Opts.Extra.(*http.OptsExtra); ok {
-		downloadFilePath := task.Meta.SingleFilepath()
-
-		cfg, _ := d.GetConfig()
-
-		// Determine if auto-torrent is enabled (use global config if not explicitly set)
-		autoTorrentEnabled := false
-		if e.AutoTorrent != nil {
-			autoTorrentEnabled = *e.AutoTorrent
-		} else if cfg != nil && cfg.AutoTorrent != nil {
-			autoTorrentEnabled = cfg.AutoTorrent.Enable
+		if !d.markTaskDone(task) {
+			return
 		}
+		d.putTask(task)
+		d.emit(EventKeyDone, task)
+		d.emit(EventKeyFinally, task, err)
+		d.notifyRunning()
+		d.releaseBlobTask(task)
+		d.triggerOnDone(task)
+		d.triggerWebhooks(WebhookEventDownloadDone, task, nil)
+		d.triggerScripts(ScriptEventDownloadDone, task, nil)
 
-		if autoTorrentEnabled && strings.HasSuffix(downloadFilePath, ".torrent") {
-			// Determine if should delete torrent file after creating BT task
-			shouldDelete := false
-			if e.DeleteTorrentAfterDownload != nil {
-				shouldDelete = *e.DeleteTorrentAfterDownload
+		if e, ok := task.Meta.Opts.Extra.(*http.OptsExtra); ok {
+			downloadFilePath := task.Meta.SingleFilepath()
+
+			cfg, _ := d.GetConfig()
+
+			// Determine if auto-torrent is enabled (use global config if not explicitly set)
+			autoTorrentEnabled := false
+			if e.AutoTorrent != nil {
+				autoTorrentEnabled = *e.AutoTorrent
 			} else if cfg != nil && cfg.AutoTorrent != nil {
-				shouldDelete = cfg.AutoTorrent.DeleteAfterDownload
+				autoTorrentEnabled = cfg.AutoTorrent.Enable
 			}
 
-			go func() {
-				_, err2 := d.CreateDirect(
-					&base.Request{
-						URL: downloadFilePath,
-					},
-					&base.Options{
-						Path:        task.Meta.Opts.Path,
-						SelectFiles: make([]int, 0),
-					})
-				if err2 != nil {
-					d.Logger.Error().Err(err2).Msgf("auto create torrent task failed, task id: %s", task.ID)
-					return
+			if autoTorrentEnabled && strings.HasSuffix(downloadFilePath, ".torrent") {
+				// Determine if should delete torrent file after creating BT task
+				shouldDelete := false
+				if e.DeleteTorrentAfterDownload != nil {
+					shouldDelete = *e.DeleteTorrentAfterDownload
+				} else if cfg != nil && cfg.AutoTorrent != nil {
+					shouldDelete = cfg.AutoTorrent.DeleteAfterDownload
 				}
 
-				if shouldDelete {
-					d.Delete(&TaskFilter{IDs: []string{task.ID}}, true)
-				}
-			}()
-		}
+				go func() {
+					_, err2 := d.CreateDirect(
+						&base.Request{
+							URL: downloadFilePath,
+						},
+						&base.Options{
+							Path:        task.Meta.Opts.Path,
+							SelectFiles: make([]int, 0),
+						})
+					if err2 != nil {
+						d.Logger.Error().Err(err2).Msgf("auto create torrent task failed, task id: %s", task.ID)
+						return
+					}
 
-		// Determine if auto-extract is enabled (use global config if not explicitly set)
-		autoExtractEnabled := false
-		if e.AutoExtract != nil {
-			autoExtractEnabled = *e.AutoExtract
-		} else if cfg != nil && cfg.Archive != nil {
-			autoExtractEnabled = cfg.Archive.AutoExtract
-		}
+					if shouldDelete {
+						d.Delete(&TaskFilter{IDs: []string{task.ID}}, true)
+					}
+				}()
+			}
 
-		// Auto-extract archive files using the extraction queue
-		// This ensures only one extraction runs at a time to prevent resource exhaustion
-		if autoExtractEnabled && isArchiveFile(downloadFilePath) {
-			d.enqueueExtraction(task, downloadFilePath, e)
+			// Determine if auto-extract is enabled (use global config if not explicitly set)
+			autoExtractEnabled := false
+			if e.AutoExtract != nil {
+				autoExtractEnabled = *e.AutoExtract
+			} else if cfg != nil && cfg.Archive != nil {
+				autoExtractEnabled = cfg.Archive.AutoExtract
+			}
+
+			// Auto-extract archive files using the extraction queue
+			// This ensures only one extraction runs at a time to prevent resource exhaustion
+			if autoExtractEnabled && isArchiveFile(downloadFilePath) {
+				d.enqueueExtraction(task, downloadFilePath, e)
+			}
 		}
+		return
 	}
 }
 
 func (d *Downloader) doOnError(task *Task, err error) {
+	d.handleOnError(task, err, false)
+}
+
+func (d *Downloader) doOnBlobSourceError(task *Task, err error) {
+	d.handleOnError(task, err, true)
+}
+
+func (d *Downloader) handleOnError(task *Task, err error, resetFetcher bool) {
+	if task == nil || task.lock == nil {
+		return
+	}
+	task.lock.Lock()
+	if !d.markTaskError(task) {
+		task.lock.Unlock()
+		return
+	}
 	d.Logger.Warn().Err(err).Msgf("task download failed, task id: %s", task.ID)
-	task.updateStatus(base.DownloadStatusError)
+	oldURL := ""
+	if task.Meta != nil && task.Meta.Req != nil {
+		oldURL = task.Meta.Req.URL
+	}
 	d.triggerOnError(task, err)
-	if task.Status == base.DownloadStatusError {
+	newURL := ""
+	if task.Meta != nil && task.Meta.Req != nil {
+		newURL = task.Meta.Req.URL
+	}
+	if oldURL != "" && newURL != oldURL {
+		// Extensions are allowed to replace an expired URL from onError. Patch the
+		// existing fetcher through its public API so protocol-owned redirect state
+		// is reset without teaching the HTTP fetcher about blob URLs.
+		if task.fetcher != nil {
+			if patchErr := task.fetcher.Patch(&base.Request{URL: newURL}, nil); patchErr != nil {
+				d.Logger.Warn().Err(patchErr).Msgf("patch recovered task url failed, task id: %s", task.ID)
+			}
+		}
+		d.releaseBlobTaskURL(task, oldURL)
+	}
+	if resetFetcher && d.taskStatus(task) == base.DownloadStatusRunning {
+		if resetErr := d.resetTaskFetcher(task); resetErr != nil {
+			d.Logger.Warn().Err(resetErr).Msgf("reset recovered task fetcher failed, task id: %s", task.ID)
+		}
+	}
+	task.lock.Unlock()
+	if d.taskStatus(task) == base.DownloadStatusError {
+		d.releaseBlobTask(task)
 		d.emit(EventKeyError, task, err)
 		d.emit(EventKeyFinally, task, err)
 		d.notifyRunning()
 		d.triggerWebhooks(WebhookEventDownloadError, task, err)
 	}
+}
+
+func (d *Downloader) resetTaskFetcher(task *Task) error {
+	if task == nil || task.Meta == nil || task.Meta.Req == nil {
+		return errors.New("task request is unavailable")
+	}
+	fm, err := d.parseFm(task.Meta.Req.URL)
+	if err != nil {
+		return err
+	}
+	opts := task.Meta.Opts
+	f := fm.Build()
+	d.setupFetcher(fm, f)
+	// A fresh source must never inherit bytes or preallocation from the failed
+	// source. HTTP opens existing targets without truncating them, so remove the
+	// old single-file target before installing a fresh fetcher.
+	if task.Meta.Res != nil && task.Meta.Opts != nil && len(task.Meta.Res.Files) > 0 {
+		if err := util.SafeRemove(task.Meta.SingleFilepath()); err != nil {
+			return err
+		}
+	}
+	f.Meta().Req = task.Meta.Req
+	f.Meta().Opts = opts
+	task.fetcherManager = fm
+	task.fetcher = f
+	task.Meta = f.Meta()
+	if task.Progress != nil {
+		task.Progress.Downloaded = 0
+		task.Progress.Speed = 0
+	}
+	return d.storage.Delete(bucketSave, task.ID)
 }
 
 func (d *Downloader) restoreTask(task *Task) error {
@@ -1155,7 +1344,6 @@ func (d *Downloader) restoreTask(task *Task) error {
 			return err
 		}
 	}
-	go d.watch(task)
 	return nil
 }
 
@@ -1197,12 +1385,12 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 	if f.Meta().Opts == nil {
 		f.Meta().Opts = opts
 	}
+	ensureRequestRawURL(f.Meta().Req)
 
 	fm, err := d.parseFm(f.Meta().Req.URL)
 	if err != nil {
 		return
 	}
-
 	task := NewTask()
 	task.fetcherManager = fm
 	task.fetcher = f
@@ -1211,6 +1399,14 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 	task.Progress = &Progress{}
 	_, task.Uploading = f.(fetcher.Uploader)
 	initTask(task)
+	if err = d.syncBlobTaskLease(task); err != nil {
+		return "", err
+	}
+	defer func() {
+		if err != nil {
+			d.releaseBlobTask(task)
+		}
+	}()
 
 	// The task has to be published before the onCreate event so that extensions can
 	// delete it from the event handler, but it isn't persisted or owned by the
@@ -1229,6 +1425,7 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 		d.triggerOnCreate(task)
 	}()
 
+	// The onCreate event may have deleted the task (doDelete releases the blob lease).
 	if task.isDeleted() || d.GetTask(task.ID) == nil {
 		d.Logger.Debug().Msgf("task deleted in onCreate event, task id: %s", task.ID)
 		return
@@ -1253,7 +1450,6 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 		err = d.doStart(task)
 	}()
 
-	go d.watch(task)
 	return
 }
 
@@ -1308,6 +1504,7 @@ func (d *Downloader) setStatus(task *Task, status base.Status) {
 
 func (d *Downloader) doStart(task *Task) (err error) {
 	var isCreate bool
+	var generation uint64
 	isReturn, err := d.statusMut(task, func() (isReturn bool, err error) {
 		if task.isDeleted() {
 			isReturn = true
@@ -1333,6 +1530,8 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		}
 		task.started = true
 		task.updateStatus(base.DownloadStatusRunning)
+		task.runGeneration++
+		generation = task.runGeneration
 
 		return
 	})
@@ -1344,17 +1543,35 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		return
 	}
 
+	started := false
 	handler := func() error {
 		task.lock.Lock()
 		defer task.lock.Unlock()
+		if !d.taskIsRunningGeneration(task, generation) {
+			return nil
+		}
 
+		if task.fetcher == nil {
+			if err := d.restoreFetcher(task); err != nil {
+				return err
+			}
+		}
 		d.triggerOnStart(task)
-
 		// Check if the task was deleted in the onStart event
 		if task.isDeleted() || d.GetTask(task.ID) == nil {
 			return nil
 		}
-
+		if !d.taskIsRunningGeneration(task, generation) {
+			return nil
+		}
+		if task.fetcher != nil {
+			task.fetcher.Meta().Req = task.Meta.Req
+			task.fetcher.Meta().Res = task.Meta.Res
+			task.fetcher.Meta().Opts = task.Meta.Opts
+		}
+		if err := d.syncBlobTaskLease(task); err != nil {
+			return err
+		}
 		if task.Meta.Res == nil {
 			err := task.fetcher.Resolve(task.Meta.Req, task.Meta.Opts)
 			if err != nil {
@@ -1406,14 +1623,17 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		}
 
 		task.Progress.Speed = 0
+		if !d.taskIsRunningGeneration(task, generation) {
+			return nil
+		}
 		task.timer.Start()
 		if err := task.fetcher.Start(); err != nil {
 			return err
 		}
+		started = true
 		if err := d.saveTask(task); err != nil {
 			return err
 		}
-		d.emit(EventKeyStart, task)
 		return nil
 	}
 	d.taskHandlers.Add(1)
@@ -1421,7 +1641,16 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		defer d.taskHandlers.Add(-1)
 
 		if err := handler(); err != nil {
-			d.doOnError(task, err)
+			if d.taskIsRunningGeneration(task, generation) {
+				d.doOnError(task, err)
+			}
+			return
+		}
+		if started {
+			if d.taskIsRunningGeneration(task, generation) {
+				d.emit(EventKeyStart, task)
+			}
+			go d.watch(task)
 		}
 	}()
 
@@ -1429,48 +1658,137 @@ func (d *Downloader) doStart(task *Task) (err error) {
 }
 
 func (d *Downloader) doPause(task *Task) (err error) {
-	isReturn, err := d.statusMut(task, func() (isReturn bool, err error) {
+	generation, isReturn, err := d.preparePause(task)
+	if err != nil || isReturn {
+		return err
+	}
+	handled, err := d.runPauseHandler(task, generation, true)
+	if err != nil {
+		d.Logger.Error().Stack().Err(err).Msgf("pause task handle failed, task id: %s", task.ID)
+		return err
+	}
+	if handled {
+		d.emit(EventKeyPause, task)
+	}
+	return nil
+}
+
+// doPauseForScheduling physically pauses a running task without emitting while
+// the caller holds d.lock, then atomically moves it to the wait queue state.
+func (d *Downloader) doPauseForScheduling(task *Task) (bool, error) {
+	generation, isReturn, err := d.preparePause(task)
+	if err != nil || isReturn {
+		return false, err
+	}
+	handled, err := d.runPauseHandler(task, generation, true)
+	if err != nil || !handled {
+		return false, err
+	}
+	task.statusLock.Lock()
+	queued := task.Status == base.DownloadStatusPause && task.runGeneration == generation
+	if queued {
+		task.Status = base.DownloadStatusWait
+	}
+	task.statusLock.Unlock()
+	return queued, nil
+}
+
+func (d *Downloader) preparePause(task *Task) (generation uint64, isReturn bool, err error) {
+	isReturn, err = d.statusMut(task, func() (isReturn bool, err error) {
 		if task.Status == base.DownloadStatusPause || task.Status == base.DownloadStatusDone {
 			isReturn = true
 			return
 		}
 
 		task.updateStatus(base.DownloadStatusPause)
+		task.runGeneration++
+		generation = task.runGeneration
 		task.timer.Pause()
 		return
 	})
 	if err != nil {
 		d.Logger.Error().Stack().Err(err).Msgf("pause task failed, task id: %s", task.ID)
-		return
 	}
-	if isReturn {
-		return
+	return generation, isReturn, err
+}
+
+func (d *Downloader) runPauseHandler(task *Task, generation uint64, pauseFetcher bool) (bool, error) {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+	if !d.taskIsPausedGeneration(task, generation) {
+		return false, nil
 	}
 
-	handler := func() error {
-		task.lock.Lock()
-		defer task.lock.Unlock()
-
-		if task.fetcher != nil {
-			if err := task.fetcher.Pause(); err != nil {
-				return err
-			}
+	if pauseFetcher && task.fetcher != nil {
+		if err := task.fetcher.Pause(); err != nil {
+			return false, err
 		}
+	}
+	if task.fetcherManager != nil && task.fetcher != nil {
+		if err := d.saveTask(task); err != nil {
+			return false, err
+		}
+	} else {
 		if err := d.putTask(task); err != nil {
-			return err
+			return false, err
 		}
-		d.emit(EventKeyPause, task)
-		return nil
 	}
-	d.taskHandlers.Add(1)
-	go func() {
-		defer d.taskHandlers.Add(-1)
+	return true, nil
+}
 
-		if err := handler(); err != nil {
-			d.Logger.Error().Stack().Err(err).Msgf("pause task handle failed, task id: %s", task.ID)
-		}
-	}()
-	return
+func (d *Downloader) taskIsRunningGeneration(task *Task, generation uint64) bool {
+	if task == nil || task.statusLock == nil {
+		return false
+	}
+	task.statusLock.Lock()
+	defer task.statusLock.Unlock()
+	return task.Status == base.DownloadStatusRunning && task.runGeneration == generation
+}
+
+func (d *Downloader) taskIsPausedGeneration(task *Task, generation uint64) bool {
+	if task == nil || task.statusLock == nil {
+		return false
+	}
+	task.statusLock.Lock()
+	defer task.statusLock.Unlock()
+	return (task.Status == base.DownloadStatusPause || task.Status == base.DownloadStatusWait) && task.runGeneration == generation
+}
+
+func (d *Downloader) taskStatus(task *Task) base.Status {
+	if task == nil || task.statusLock == nil {
+		return ""
+	}
+	task.statusLock.Lock()
+	defer task.statusLock.Unlock()
+	return task.Status
+}
+
+func (d *Downloader) markTaskDone(task *Task) bool {
+	if task == nil || task.statusLock == nil {
+		return false
+	}
+	task.statusLock.Lock()
+	defer task.statusLock.Unlock()
+	if task.Status != base.DownloadStatusRunning {
+		return false
+	}
+	task.updateStatus(base.DownloadStatusDone)
+	task.runGeneration++
+	return true
+}
+
+func (d *Downloader) markTaskError(task *Task) bool {
+	if task == nil || task.statusLock == nil {
+		return false
+	}
+	task.statusLock.Lock()
+	defer task.statusLock.Unlock()
+	if task.Status != base.DownloadStatusRunning {
+		return false
+	}
+	task.updateStatus(base.DownloadStatusError)
+	task.runGeneration++
+	return true
 }
 
 // redirect stderr to log file, when panic happened log it
@@ -1890,8 +2208,77 @@ func initTask(task *Task) {
 	task.persistLock = &sync.Mutex{}
 	task.deleted = &atomic.Bool{}
 	task.creating = &atomic.Bool{}
+	task.blobRefLock = &sync.Mutex{}
 	task.speedArr = make([]int64, 0)
 	task.uploadSpeedArr = make([]int64, 0)
+}
+
+func (d *Downloader) releaseBlobTask(task *Task) {
+	if d.blob == nil || task == nil {
+		return
+	}
+	if task.blobRefLock != nil {
+		task.blobRefLock.Lock()
+		raw := task.blobURL
+		task.blobURL = ""
+		task.blobRefLock.Unlock()
+		if raw != "" {
+			_ = d.blob.Release(raw)
+		}
+	}
+}
+
+func (d *Downloader) syncBlobTaskLease(task *Task) error {
+	if d.blob == nil || task == nil || task.Meta == nil || task.Meta.Req == nil {
+		return nil
+	}
+	if task.blobRefLock == nil {
+		task.blobRefLock = &sync.Mutex{}
+	}
+	task.blobRefLock.Lock()
+	defer task.blobRefLock.Unlock()
+	terminal := false
+	if task.statusLock != nil {
+		task.statusLock.Lock()
+		terminal = task.Status == base.DownloadStatusDone || task.Status == base.DownloadStatusError
+		task.statusLock.Unlock()
+	}
+	newURL := ""
+	if !terminal && d.blob.IsURL(task.Meta.Req.URL) {
+		newURL = task.Meta.Req.URL
+	}
+	if task.blobURL == newURL {
+		return nil
+	}
+	if newURL != "" {
+		if err := d.blob.Acquire(newURL); err != nil {
+			return err
+		}
+	}
+	oldURL := task.blobURL
+	task.blobURL = newURL
+	if oldURL != "" {
+		_ = d.blob.Release(oldURL)
+	}
+	return nil
+}
+
+func (d *Downloader) releaseBlobTaskURL(task *Task, raw string) {
+	if d.blob == nil || task == nil || raw == "" {
+		return
+	}
+	if task.blobRefLock == nil {
+		task.blobRefLock = &sync.Mutex{}
+	}
+	task.blobRefLock.Lock()
+	claimed := task.blobURL == raw
+	if claimed {
+		task.blobURL = ""
+	}
+	task.blobRefLock.Unlock()
+	if claimed {
+		_ = d.blob.Release(raw)
+	}
 }
 
 var defaultDownloader = NewDownloader(nil)

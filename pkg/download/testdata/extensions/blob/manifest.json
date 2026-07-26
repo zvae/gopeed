@@ -1,0 +1,16 @@
+{
+  "name": "blob",
+  "title": "gopeed extension blob test",
+  "version": "0.0.1",
+  "scripts": [
+    {
+      "event": "onResolve",
+      "match": {
+        "urls": [
+          "*://example.com/*"
+        ]
+      },
+      "entry": "index.js"
+    }
+  ]
+}

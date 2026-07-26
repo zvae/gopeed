@@ -7,6 +7,7 @@ import 'langs/fr_fr.dart';
 import 'langs/id_id.dart';
 import 'langs/it_it.dart';
 import 'langs/ja_jp.dart';
+import 'langs/ko_kr.dart';
 import 'langs/pl_pl.dart';
 import 'langs/ru_ru.dart';
 import 'langs/ta_ta.dart';
@@ -18,6 +19,8 @@ import 'langs/es_es.dart';
 import 'langs/uk_ua.dart';
 import 'langs/hu_hu.dart';
 import 'langs/pt_br.dart';
+import 'langs/ca_es.dart';
+import 'langs/ar_ar.dart';
 
 final messages = _Messages();
 
@@ -31,6 +34,7 @@ class _Messages extends Translations {
         ...zhTW,
         ...faIR,
         ...jaJP,
+        ...koKR,
         ...viVN,
         ...taTA,
         ...trTR,
@@ -42,6 +46,8 @@ class _Messages extends Translations {
         ...ukUA,
         ...huHU,
         ...ptBR,
-        ...deDE
+        ...deDE,
+        ...caES,
+        ...arAR,
       };
 }

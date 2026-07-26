@@ -299,6 +299,53 @@ func TestFetcher_DownloadContinue(t *testing.T) {
 	downloadContinue(listener, 16, t)
 }
 
+func TestFetcher_DownloadContinue_NoRangeRestart(t *testing.T) {
+	listener := test.StartTestNoRangeSlowServer(time.Millisecond)
+	defer listener.Close()
+
+	fetcher := downloadReady(listener, 4, t)
+	if err := fetcher.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	stats := fetcher.Stats().(*http.Stats)
+	if len(stats.Connections) != 1 {
+		t.Fatalf("expected a single non-range connection, got %d", len(stats.Connections))
+	}
+	if stats.Connections[0].Downloaded <= 0 || stats.Connections[0].Downloaded >= test.BuildSize {
+		t.Fatalf("expected partial download before pause, got %d", stats.Connections[0].Downloaded)
+	}
+
+	if err := fetcher.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetcher.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetcher.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	finalStats := fetcher.Stats().(*http.Stats)
+	if len(finalStats.Connections) != 1 {
+		t.Fatalf("expected a single non-range connection after resume, got %d", len(finalStats.Connections))
+	}
+	if finalStats.Connections[0].Downloaded != test.BuildSize {
+		t.Fatalf("downloaded bytes should restart cleanly: got %d, want %d", finalStats.Connections[0].Downloaded, test.BuildSize)
+	}
+	if total := fetcher.Progress().TotalDownloaded(); total != test.BuildSize {
+		t.Fatalf("progress total = %d, want %d", total, test.BuildSize)
+	}
+
+	want := test.FileMd5(test.BuildFile)
+	got := test.FileMd5(test.DownloadFile)
+	if want != got {
+		t.Errorf("Download() got = %v, want %v", got, want)
+	}
+}
+
 func TestFetcher_DownloadChunked(t *testing.T) {
 	listener := test.StartTestCustomServer()
 	defer listener.Close()
@@ -329,7 +376,7 @@ func TestFetcher_DownloadError(t *testing.T) {
 }
 
 func TestFetcher_DownloadLimit(t *testing.T) {
-	listener := test.StartTestLimitServer(4, 0)
+	listener := test.StartTestConLimitServer(4)
 	defer listener.Close()
 
 	downloadNormal(listener, 1, t)
@@ -567,7 +614,7 @@ func TestFetcher_SlowStartExpansion(t *testing.T) {
 			os.Remove(test.DownloadFile)
 
 			// Use 100ns delay per byte for faster test (~10MB/s theoretical)
-			listener := test.StartTestSlowStartServer(100 * time.Nanosecond)
+			listener := test.StartTestLowSpeedServer(100 * time.Nanosecond)
 
 			// Ensure cleanup happens before next subtest
 			cleanup := func() {
@@ -711,7 +758,7 @@ func TestFetcher_AsyncPrefetch(t *testing.T) {
 	t.Run("PrefetchPartial", func(t *testing.T) {
 		// Use slow server with 100 nanosecond delay per byte
 		// This means ~10MB/s speed, so 100ms should download ~1MB
-		listener := test.StartTestSlowStartServer(100 * time.Nanosecond)
+		listener := test.StartTestLowSpeedServer(100 * time.Nanosecond)
 		defer listener.Close()
 
 		fetcher := buildFetcher()
@@ -1384,8 +1431,8 @@ func TestFetcher_Patch_Extra(t *testing.T) {
 			Method: "POST", // Update method
 			// Body is empty, should NOT update
 			Header: map[string]string{
-				"X-Custom":   "modified", // Overwrite existing
-				"X-New":      "added",    // Add new
+				"X-Custom": "modified", // Overwrite existing
+				"X-New":    "added",    // Add new
 				// Authorization is not in patch, should remain
 			},
 		},
