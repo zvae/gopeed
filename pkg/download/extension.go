@@ -271,7 +271,6 @@ func (d *Downloader) triggerOnResolve(req *base.Request) (res *base.Resource, er
 				}
 				ensureResourceRequestRawURLs(req, ctx.Res)
 				ctx.Res.CalcSize(nil)
-				d.applyGBlobResourceMetadata(ctx.Res)
 			}
 			res = ctx.Res
 		},
@@ -279,25 +278,12 @@ func (d *Downloader) triggerOnResolve(req *base.Request) (res *base.Resource, er
 	return
 }
 
-func (d *Downloader) applyGBlobResourceMetadata(res *base.Resource) {
-	if d.gblob == nil || res == nil {
-		return
-	}
-	for _, file := range res.Files {
-		if file == nil || file.Req == nil {
-			continue
-		}
-		_ = d.gblob.SetSize(file.Req.URL, file.Size)
-		_ = d.gblob.SetRange(file.Req.URL, res.Range)
-	}
-}
-
 func (d *Downloader) triggerOnStart(task *Task) {
 	doTrigger(d,
 		EventOnStart,
 		task.Meta.Req,
 		&OnStartContext{
-			Task: NewExtensionTask(d, task),
+			Task: newOnStartExtensionTask(task),
 		},
 		func(ext *Extension, gopeed *Instance, ctx *OnStartContext) {
 			// Validate request structure
@@ -309,7 +295,6 @@ func (d *Downloader) triggerOnStart(task *Task) {
 			}
 		},
 	)
-	return
 }
 
 func (d *Downloader) triggerOnError(task *Task, err error) {
@@ -317,7 +302,7 @@ func (d *Downloader) triggerOnError(task *Task, err error) {
 		EventOnError,
 		task.Meta.Req,
 		&OnErrorContext{
-			Task:  NewExtensionTask(d, task),
+			Task:  newOnErrorExtensionTask(d, task),
 			Error: err,
 		},
 		nil,
@@ -328,8 +313,8 @@ func (d *Downloader) triggerOnDone(task *Task) {
 	doTrigger(d,
 		EventOnDone,
 		task.Meta.Req,
-		&OnErrorContext{
-			Task: NewExtensionTask(d, task),
+		&OnDoneContext{
+			Task: newOnDoneExtensionTask(task),
 		},
 		nil,
 	)
@@ -724,8 +709,8 @@ type OnStartContext struct {
 }
 
 type OnErrorContext struct {
-	Task  *ExtensionTask `json:"task"`
-	Error error          `json:"error"`
+	Task  *OnErrorExtensionTask `json:"task"`
+	Error error                 `json:"error"`
 }
 
 type OnDoneContext struct {
@@ -736,29 +721,49 @@ type OnDoneContext struct {
 // Avoid extension scripts modifying task directly, use ExtensionTask to encapsulate task,
 // only some fields can be modified, such as request info.
 type ExtensionTask struct {
-	download *Downloader
-
 	*Task
 }
 
-func NewExtensionTask(download *Downloader, task *Task) *ExtensionTask {
-	// restricts extension scripts to only modify request info
+// OnErrorExtensionTask adds error-recovery controls to ExtensionTask.
+// Continue is intentionally only exposed to onError handlers.
+type OnErrorExtensionTask struct {
+	download *Downloader
+
+	*ExtensionTask
+}
+
+func cloneExtensionTask(task *Task) *Task {
 	newTask := task.clone()
 	newTask.Meta.Req = task.Meta.Req
-	return &ExtensionTask{
-		download: download,
-		Task:     newTask,
+	return newTask
+}
+
+func newExtensionTask(task *Task) *ExtensionTask {
+	return &ExtensionTask{Task: cloneExtensionTask(task)}
+}
+
+func newOnStartExtensionTask(task *Task) *ExtensionTask {
+	return newExtensionTask(task)
+}
+
+func newOnErrorExtensionTask(download *Downloader, task *Task) *OnErrorExtensionTask {
+	return &OnErrorExtensionTask{
+		download:      download,
+		ExtensionTask: newExtensionTask(task),
 	}
 }
 
-func (t *ExtensionTask) Continue() error {
-	return t.download.Continue(&TaskFilter{
-		IDs: []string{t.ID},
-	})
+func newOnDoneExtensionTask(task *Task) *Task {
+	return cloneExtensionTask(task)
 }
 
-func (t *ExtensionTask) Pause() error {
-	return t.download.Pause(&TaskFilter{
+// SetUrl replaces the task request URL.
+func (t *ExtensionTask) SetUrl(url string) {
+	t.Meta.Req.URL = url
+}
+
+func (t *OnErrorExtensionTask) Continue() error {
+	return t.download.Continue(&TaskFilter{
 		IDs: []string{t.ID},
 	})
 }

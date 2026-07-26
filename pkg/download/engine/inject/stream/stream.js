@@ -1,9 +1,5 @@
 (function () {
   const createBlobObjectURL = globalThis.__gopeed_create_blob_object_url;
-  const createWritableObjectURL = globalThis.__gopeed_create_writable_stream_object_url;
-  const writeWritableObjectURL = globalThis.__gopeed_write_writable_stream_object_url;
-  const closeWritableObjectURL = globalThis.__gopeed_close_writable_stream_object_url;
-  const abortWritableObjectURL = globalThis.__gopeed_abort_writable_stream_object_url;
   const revokeObjectURL = globalThis.__gopeed_revoke_object_url;
   const fetchOpen = globalThis.__gopeed_fetch_open;
   const fetchRead = globalThis.__gopeed_fetch_read;
@@ -447,38 +443,6 @@
     return merged;
   }
 
-  function createStreamBackedBlob(stream, contentType, size) {
-    const blob = new Blob([], { type: contentType || "" });
-    if (Number.isFinite(size) && size >= 0) {
-      try {
-        Object.defineProperty(blob, "size", {
-          configurable: true,
-          enumerable: true,
-          value: size,
-        });
-      } catch (_) {
-      }
-    }
-    blob.__gopeedStreamBackedBlob = true;
-    blob.__gopeedBodyStream = stream;
-    blob.stream = function () {
-      const bodyStream = this.__gopeedBodyStream;
-      this.__gopeedBodyStream = null;
-      if (bodyStream instanceof ReadableStream) {
-        return bodyStream;
-      }
-      return new Blob([], { type: this.type || "" }).stream();
-    };
-    blob.arrayBuffer = async function () {
-      const bytes = await readAllFromStream(this.stream(), false);
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    };
-    blob.text = async function () {
-      return readAllFromStream(this.stream(), true);
-    };
-    return blob;
-  }
-
   function attachResponseStreaming(response, stream) {
     response.__gopeedBodyStream = stream;
     response.__gopeedBodyConsumed = false;
@@ -515,8 +479,11 @@
       ensureUnused();
       markBodyUsed();
       const contentType = this.headers && this.headers.get ? (this.headers.get("content-type") || "") : "";
-      const contentLength = this.headers && this.headers.get ? parseInt(this.headers.get("content-length") || "", 10) : NaN;
-      return createStreamBackedBlob(stream, contentType, contentLength);
+      // Response.blob() is a materializing body consumer. Keeping the live
+      // response stream behind an empty one-shot Blob makes retry, range and a
+      // second object-URL reader silently produce an empty file.
+      const bytes = await readAllFromStream(stream, false);
+      return new Blob([bytes], { type: contentType });
     };
     response.json = async function () {
       const text = await this.text();
@@ -545,23 +512,7 @@
     }
   }
 
-  const originalCreateObjectURL = typeof URL.createObjectURL === "function"
-    ? URL.createObjectURL.bind(URL)
-    : null;
-  const originalRevokeObjectURL = typeof URL.revokeObjectURL === "function"
-    ? URL.revokeObjectURL.bind(URL)
-    : null;
-  const resumableReadableObjectURLs = new Map();
-  const activeReadableObjectURLs = new Map();
-  const readableObjectURLYieldBytes = 256 * 1024;
-
-  function isIgnorableGBlobObjectURLError(error) {
-    const message = error == null ? "" : String(error && error.message ? error.message : error);
-    return message.indexOf("gblob source revoked") >= 0 ||
-      message.indexOf("gblob source not found") >= 0 ||
-      message.indexOf("gblob source closed") >= 0 ||
-      message.indexOf("gblob source aborted") >= 0;
-  }
+  const blobReaders = new Map();
 
   function getValueTypeName(value) {
     if (value === null) {
@@ -577,58 +528,54 @@
   }
 
   function toReadableStreamReader(value, sourceLabel) {
-    if (value instanceof ReadableStream) {
+    if (value && typeof value.getReader === "function") {
       return value.getReader();
     }
     throw new TypeError(sourceLabel + " must return a ReadableStream, got " + getValueTypeName(value));
   }
 
-  function describeObjectURLValue(value) {
-    if (value && value.__gopeedStreamBackedBlob) {
-      const stream = value.__gopeedBodyStream;
-      value.__gopeedBodyStream = null;
-      if (stream instanceof ReadableStream) {
-        return {
-          kind: "readable",
-          initialReadable: stream,
-          openReadable: null,
-          sourceLabel: "URL.createObjectURL Response blob stream",
-        };
+  async function openBlobReadable(blob, request) {
+    const { offset, end } = request;
+    const sliced = blob.slice(offset, end >= offset ? end + 1 : undefined);
+    if (sliced && typeof sliced.stream === "function") {
+      try {
+        const stream = sliced.stream();
+        if (stream && typeof stream.getReader === "function") {
+          return stream;
+        }
+      } catch (_) {
       }
     }
+    if (sliced && typeof sliced.arrayBuffer === "function") {
+      const buffer = await sliced.arrayBuffer();
+      return new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(buffer));
+          controller.close();
+        },
+      });
+    }
+    throw new TypeError("Blob source cannot be converted to a ReadableStream");
+  }
+
+  function describeObjectURLValue(value) {
     if (value instanceof Blob) {
       return {
         kind: "blob",
         value,
       };
     }
-    if (value instanceof ReadableStream) {
-      return {
-        kind: "readable",
-        initialReadable: value,
-        openReadable: null,
-        sourceLabel: "URL.createObjectURL ReadableStream",
-      };
-    }
     if (typeof value === "function") {
       return {
         kind: "opener",
-        initialReadable: null,
         openReadable: value,
-        sourceLabel: "URL.createObjectURL opener function",
+        sourceLabel: "gopeed.runtime.blob.createObjectURL opener function",
       };
     }
     return {
       kind: "other",
       value,
     };
-  }
-
-  function startReadableObjectURL(url, state) {
-    activeReadableObjectURLs.set(url, state);
-    setTimeout(() => {
-      void pumpReadableObjectURL(url, state);
-    }, 0);
   }
 
   function releaseReader(reader, reason) {
@@ -652,144 +599,287 @@
     }
   }
 
-  function releaseActiveReadable(url, reason) {
-    const active = activeReadableObjectURLs.get(url);
-    if (!active) {
-      return;
+  function normalizeBlobObjectURLOptions(value, options, defaultRange) {
+    const normalized = {
+      contentType: "",
+      size: 0,
+      range: !!defaultRange,
+    };
+    if (options && typeof options === "object") {
+      if (typeof options.contentType === "string") {
+        normalized.contentType = options.contentType;
+      }
+      if (Number.isFinite(Number(options.size)) && Number(options.size) > 0) {
+        normalized.size = Number(options.size);
+      }
+      if (typeof options.range === "boolean") {
+        normalized.range = options.range;
+      }
     }
-    activeReadableObjectURLs.delete(url);
-    active.cancelled = true;
-    releaseReader(active.reader, reason);
+    if (!normalized.contentType && value && typeof value.type === "string") {
+      normalized.contentType = value.type;
+    }
+    if (!normalized.size && value) {
+      if (Number.isFinite(Number(value.size)) && Number(value.size) > 0) {
+        normalized.size = Number(value.size);
+      } else if (value._buffer && Number.isFinite(Number(value._buffer.byteLength))) {
+        normalized.size = Number(value._buffer.byteLength);
+      }
+    }
+    return normalized;
   }
 
-  async function pumpReadableObjectURL(url, state) {
-    let reader = null;
-    try {
-      let source;
-      if (state.initialReadable) {
-        source = state.initialReadable;
-        state.initialReadable = null;
+  function validateBlobObjectURLOptions(options) {
+    if (options.range && !(Number.isFinite(Number(options.size)) && Number(options.size) > 0)) {
+      throw new TypeError("gopeed.runtime.blob.createObjectURL options.range requires a positive options.size");
+    }
+  }
+
+  function normalizeOpenRequest(request) {
+    const offset = Math.max(0, Number(request && request.offset) || 0);
+    const endValue = Number(request && request.end);
+    const end = Number.isFinite(endValue) ? endValue : -1;
+    return { offset, end };
+  }
+
+  function yieldBlobPipeTask() {
+    return new Promise((resolve) => {
+      if (typeof setTimeout === "function") {
+        setTimeout(resolve, 0);
       } else {
-        if (typeof state.openReadable !== "function") {
-          throw new Error("gblob readable stream is not reopenable");
-        }
-        source = await state.openReadable(state.offset);
+        Promise.resolve().then(resolve);
       }
-      reader = toReadableStreamReader(source, state.sourceLabel);
-      if (activeReadableObjectURLs.get(url) !== state || state.cancelled) {
-        releaseReader(reader, "stale gblob producer");
-        reader = null;
-        return;
-      }
-      state.reader = reader;
-      let bytesSinceYield = 0;
-      while (!state.cancelled) {
-        const current = activeReadableObjectURLs.get(url);
-        if (current !== state) {
-          releaseReader(reader, "stale gblob producer");
-          reader = null;
-          return;
-        }
-        const { done, value } = await reader.read();
-        if (done) {
-          if (activeReadableObjectURLs.get(url) === state) {
-            activeReadableObjectURLs.delete(url);
-            await closeWritableObjectURL(url);
-          }
-          releaseReader(reader);
-          reader = null;
-          return;
-        }
-        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-        if (activeReadableObjectURLs.get(url) !== state || state.cancelled) {
-          releaseReader(reader, "stale gblob producer");
-          reader = null;
-          return;
-        }
-        await writeWritableObjectURL(url, chunk);
-        bytesSinceYield += chunk.byteLength;
-        if (bytesSinceYield >= readableObjectURLYieldBytes) {
-          bytesSinceYield = 0;
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      }
-      releaseReader(reader, "gblob producer cancelled");
-      reader = null;
-    } catch (error) {
-      if (isIgnorableGBlobObjectURLError(error)) {
-        if (activeReadableObjectURLs.get(url) === state) {
-          activeReadableObjectURLs.delete(url);
-        }
-        if (reader) {
-          releaseReader(reader, "gblob source closed");
-          reader = null;
-        }
-        return;
-      }
-      if (activeReadableObjectURLs.get(url) === state) {
-        activeReadableObjectURLs.delete(url);
-        try {
-          await abortWritableObjectURL(url, error == null ? "" : String(error && error.message ? error.message : error));
-        } catch (_) {
-        }
-      }
-      if (reader) {
-        releaseReader(reader, error);
-        reader = null;
-      }
-    }
+    });
   }
 
-  globalThis.__gopeed_open_writable_stream_object_url = function (url, offset) {
-    const openReadable = resumableReadableObjectURLs.get(url);
-    if (typeof openReadable !== "function") {
-      throw new Error("gblob resumable opener not found");
+  function createPendingBlobReader(openReadable, request) {
+    let activeReader;
+    let ready;
+    function ensureReader() {
+      if (ready) {
+        return ready;
+      }
+      ready = (async function () {
+        const source = await openReadable(normalizeOpenRequest(request));
+        activeReader = toReadableStreamReader(source, "gopeed.runtime.blob.createObjectURL opener function");
+        return activeReader;
+      })();
+      return ready;
     }
-    releaseActiveReadable(url, "gblob source reopened");
-    startReadableObjectURL(url, {
-      initialReadable: null,
-      openReadable,
-      sourceLabel: "URL.createObjectURL opener function",
-      offset: Number(offset) || 0,
-      reader: null,
-      cancelled: false,
-    });
+    return {
+      async read() {
+        const reader = await ensureReader();
+        return reader.read();
+      },
+      cancel(reason) {
+        return ensureReader().then(function (reader) {
+          return reader.cancel(reason);
+        }, function () {});
+      },
+      releaseLock() {
+        if (!ready) {
+          return;
+        }
+        return ready.then(function (reader) {
+          return reader.releaseLock();
+        }, function () {});
+      }
+    };
+  }
+
+  globalThis.__gopeed_blob_open_source = function (openReadable, request) {
+    if (typeof openReadable !== "function") {
+      throw new TypeError("blob opener must be callable");
+    }
+    const id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + String(Math.random());
+    blobReaders.set(id, createPendingBlobReader(openReadable, request));
+    return id;
   };
 
-  URL.createObjectURL = function (value) {
+  globalThis.__gopeed_blob_read_source = async function (id, chunkSize) {
+    const reader = blobReaders.get(id);
+    if (!reader) {
+      return null;
+    }
+    const { done, value } = await reader.read();
+    if (done) {
+      blobReaders.delete(id);
+      releaseReader(reader);
+      return null;
+    }
+    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const size = Math.max(1, Number(chunkSize) || chunk.byteLength);
+    if (chunk.byteLength <= size) {
+      return chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+    }
+    const head = chunk.slice(0, size);
+    let offset = size;
+    blobReaders.set(id, {
+      read() {
+        if (offset >= chunk.byteLength) {
+          return reader.read();
+        }
+        const next = chunk.slice(offset, Math.min(offset + size, chunk.byteLength));
+        offset += next.byteLength;
+        return Promise.resolve({ done: false, value: next });
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+      releaseLock() {
+        return reader.releaseLock();
+      }
+    });
+    return head.buffer.slice(head.byteOffset, head.byteOffset + head.byteLength);
+  };
+
+  globalThis.__gopeed_blob_close_source = function (id) {
+    const reader = blobReaders.get(id);
+    if (!reader) {
+      return;
+    }
+    blobReaders.delete(id);
+    releaseReader(reader, "blob request closed");
+  };
+
+  const blobPipeReaderStates = new Map();
+
+  function releaseBlobPipeReader(state) {
+    if (!state || state.released) {
+      return;
+    }
+    state.released = true;
+    if (state.reader && typeof state.reader.releaseLock === "function") {
+      try {
+        state.reader.releaseLock();
+      } catch (_) {
+      }
+    }
+    if (blobPipeReaderStates.get(state.pipeId) === state) {
+      blobPipeReaderStates.delete(state.pipeId);
+    }
+  }
+
+  function finishBlobPipeReader(state, cancel, reason) {
+    if (!state) {
+      return Promise.resolve();
+    }
+    if (cancel) {
+      state.cancelRequested = true;
+      if (reason !== undefined) {
+        state.cancelReason = reason;
+      }
+    }
+    if (state.cleanupPromise) {
+      return state.cleanupPromise;
+    }
+    if (!state.reader) {
+      // A cancellation may arrive while the asynchronous opener is pending.
+      // Keep the state until the reader exists so it can still be canceled.
+      if (!state.cancelRequested || state.openSettled) {
+        releaseBlobPipeReader(state);
+      }
+      return Promise.resolve();
+    }
+
+    state.cleanupPromise = (async function () {
+      try {
+        if (state.cancelRequested && typeof state.reader.cancel === "function") {
+          await state.reader.cancel(state.cancelReason);
+        }
+      } catch (_) {
+      } finally {
+        releaseBlobPipeReader(state);
+      }
+    })();
+    return state.cleanupPromise;
+  }
+
+  globalThis.__gopeed_blob_cancel_pipe_source = function (pipeId, reason) {
+    const state = blobPipeReaderStates.get(pipeId);
+    if (!state) {
+      return;
+    }
+    // finishBlobPipeReader invokes reader.cancel() synchronously up to its
+    // first await. Do not return the cleanup Promise: Go only needs to ensure
+    // cancellation has started before releasing the source session.
+    finishBlobPipeReader(state, true, reason).catch(function () {});
+  };
+
+  globalThis.__gopeed_blob_pipe_source = function (openReadable, request, pipeId) {
+    if (typeof openReadable !== "function") {
+      throw new TypeError("blob opener must be callable");
+    }
+    const state = {
+      pipeId,
+      reader: null,
+      cancelRequested: false,
+      cancelReason: "blob pipe closed",
+      cleanupPromise: null,
+      openSettled: false,
+      released: false,
+    };
+    blobPipeReaderStates.set(pipeId, state);
+    const startPipe = async function () {
+      try {
+        const source = await openReadable(normalizeOpenRequest(request));
+        state.openSettled = true;
+        state.reader = toReadableStreamReader(source, "gopeed.runtime.blob.createObjectURL opener function");
+        if (state.cancelRequested) {
+          await finishBlobPipeReader(state, true, state.cancelReason);
+          return;
+        }
+        while (true) {
+          const { done, value } = await state.reader.read();
+          if (done) {
+            globalThis.__gopeed_blob_pipe_close(pipeId);
+            return;
+          }
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+          const buffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+          if (!globalThis.__gopeed_blob_pipe_chunk(pipeId, buffer)) {
+            state.cancelRequested = true;
+            state.cancelReason = "blob pipe closed";
+            return;
+          }
+          await yieldBlobPipeTask();
+        }
+      } catch (error) {
+        if (!state.cancelRequested) {
+          globalThis.__gopeed_blob_pipe_error(pipeId, error && error.stack ? error.stack : String(error));
+        }
+      } finally {
+        state.openSettled = true;
+        await finishBlobPipeReader(state, state.cancelRequested, state.cancelReason);
+      }
+    };
+    if (typeof setTimeout === "function") {
+      setTimeout(startPipe, 0);
+    } else {
+      Promise.resolve().then(startPipe);
+    }
+  };
+
+  globalThis.__gopeed_blob_create_object_url = function (value, options) {
     const described = describeObjectURLValue(value);
     if (described.kind === "blob") {
-      return createBlobObjectURL(described.value._buffer, described.value.type || "");
-    }
-    if (described.kind === "readable") {
-      const url = createWritableObjectURL(false);
-      startReadableObjectURL(url, {
-        initialReadable: described.initialReadable,
-        openReadable: null,
-        sourceLabel: described.sourceLabel,
-        offset: 0,
-        reader: null,
-        cancelled: false,
-      });
-      return url;
+      const blob = described.value;
+      const normalized = normalizeBlobObjectURLOptions(blob, options, Number(blob.size) > 0);
+      validateBlobObjectURLOptions(normalized);
+      const opener = async (request) => openBlobReadable(blob, request);
+      return createBlobObjectURL(opener, normalized);
     }
     if (described.kind === "opener") {
-      const url = createWritableObjectURL(true);
-      resumableReadableObjectURLs.set(url, described.openReadable);
-      return url;
+      const normalized = normalizeBlobObjectURLOptions(null, options, false);
+      validateBlobObjectURLOptions(normalized);
+      return createBlobObjectURL(described.openReadable, normalized);
     }
-    throw new TypeError("Unsupported object type for URL.createObjectURL: " + getValueTypeName(described.value) + ". Expected Blob, ReadableStream, or opener function");
+    throw new TypeError("Unsupported object type for gopeed.runtime.blob.createObjectURL: " + getValueTypeName(described.value) + ". Expected Blob or opener function");
   };
 
-  URL.revokeObjectURL = function (url) {
-    if (typeof url === "string" && url.indexOf("gblob:") === 0) {
-      resumableReadableObjectURLs.delete(url);
-      releaseActiveReadable(url, "gblob source revoked");
+  globalThis.__gopeed_blob_revoke_object_url = function (url) {
+    if (typeof url === "string") {
       revokeObjectURL(url);
-      return;
-    }
-    if (originalRevokeObjectURL) {
-      originalRevokeObjectURL(url);
     }
   };
 
@@ -823,7 +913,7 @@
       });
       let meta;
       try {
-        meta = fetchOpen({
+        meta = await fetchOpen({
           url: request.url,
           method: request.method,
           headers,
@@ -835,10 +925,10 @@
         throw error instanceof Error ? error : new TypeError(String(error));
       }
       const stream = new ReadableStream({
-        pull(controller) {
+        async pull(controller) {
           let chunk;
           try {
-            chunk = fetchRead(meta.id, 64 * 1024);
+            chunk = await fetchRead(meta.id, 64 * 1024);
           } catch (error) {
             fetchClose(meta.id);
             controller.error(error instanceof Error ? error : new TypeError(String(error)));
