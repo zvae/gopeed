@@ -22,6 +22,7 @@ jobs:
     steps:
       - name: Create release draft
         uses: release-drafter/release-drafter@v6
+        id: create_release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -32,3 +33,39 @@ jobs:
           version: ${{ github.event.inputs.version }}
           publish: false
           prerelease: false
+      - name: Apply explicit version to release body
+        uses: actions/github-script@v8
+        env:
+          RELEASE_ID: ${{ steps.create_release.outputs.id }}
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const releaseId = Number(process.env.RELEASE_ID);
+            const version = process.env.RELEASE_VERSION.trim();
+            if (!releaseId || !version) {
+              core.setFailed("release id and version must not be empty");
+              return;
+            }
+
+            const { data: release } = await github.rest.repos.getRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+            });
+            const body = (release.body || "")
+              .replaceAll("$NEXT_PATCH_VERSION", version)
+              .replaceAll("$RESOLVED_VERSION", version);
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              tag_name: `v${version}`,
+              target_commitish: process.env.TARGET_BRANCH,
+              name: `v${version}`,
+              body,
+              draft: true,
+              prerelease: false,
+            });
