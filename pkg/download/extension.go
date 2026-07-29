@@ -38,6 +38,7 @@ type ActivationEvent string
 
 const (
 	EventOnResolve ActivationEvent = "onResolve"
+	EventOnCreate  ActivationEvent = "onCreate"
 	EventOnStart   ActivationEvent = "onStart"
 	EventOnError   ActivationEvent = "onError"
 	EventOnDone    ActivationEvent = "onDone"
@@ -320,6 +321,17 @@ func (d *Downloader) triggerOnDone(task *Task) {
 	)
 }
 
+func (d *Downloader) triggerOnCreate(task *Task) {
+	doTrigger(d,
+		EventOnCreate,
+		task.Meta.Req,
+		&OnCreateContext{
+			Task: newOnCreateExtensionTask(d, task),
+		},
+		nil,
+	)
+}
+
 func doTrigger[T any](d *Downloader, event ActivationEvent, req *base.Request, ctx T, handler func(ext *Extension, gopeed *Instance, ctx T)) error {
 	// init extension global object
 	gopeed := &Instance{
@@ -339,6 +351,7 @@ func doTrigger[T any](d *Downloader, event ActivationEvent, req *base.Request, c
 					storage:  d.storage,
 					identity: ext.buildIdentity(),
 				}
+				gopeed.File = &ContextFile{}
 				scriptFilePath := filepath.Join(d.ExtensionPath(ext), script.Entry)
 				if _, err = os.Stat(scriptFilePath); os.IsNotExist(err) {
 					gopeed.Logger.logger.Error().Err(err).Msgf("[%s] script file not exist", ext.buildIdentity())
@@ -612,7 +625,54 @@ type Instance struct {
 	Logger   *InstanceLogger  `json:"logger"`
 	Settings map[string]any   `json:"settings"`
 	Storage  *ContextStorage  `json:"storage"`
+	File     *ContextFile     `json:"file"`
 	Runtime  *InstanceRuntime `json:"runtime"`
+}
+
+type ContextFile struct {
+}
+
+func (f *ContextFile) Exists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
+}
+
+func (f *ContextFile) Size(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func (f *ContextFile) IsFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func (f *ContextFile) IsDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+func (f *ContextFile) Stat(path string) (map[string]any, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"name":    info.Name(),
+		"size":    info.Size(),
+		"mode":    info.Mode().String(),
+		"modTime": info.ModTime().Unix(),
+		"isDir":   info.IsDir(),
+	}, nil
 }
 
 type InstanceRuntime struct {
@@ -639,6 +699,10 @@ func (h InstanceEvents) OnError(fn engine.JSFunction) {
 
 func (h InstanceEvents) OnDone(fn engine.JSFunction) {
 	h.register(EventOnDone, fn)
+}
+
+func (h InstanceEvents) OnCreate(fn engine.JSFunction) {
+	h.register(EventOnCreate, fn)
 }
 
 type ExtensionInfo struct {
@@ -717,6 +781,10 @@ type OnDoneContext struct {
 	Task *Task `json:"task"`
 }
 
+type OnCreateContext struct {
+	Task *OnCreateExtensionTask `json:"task"`
+}
+
 // ExtensionTask is a wrapper of Task, it's used to interact with extension scripts.
 // Avoid extension scripts modifying task directly, use ExtensionTask to encapsulate task,
 // only some fields can be modified, such as request info.
@@ -727,6 +795,15 @@ type ExtensionTask struct {
 // OnErrorExtensionTask adds error-recovery controls to ExtensionTask.
 // Continue is intentionally only exposed to onError handlers.
 type OnErrorExtensionTask struct {
+	download *Downloader
+
+	*ExtensionTask
+}
+
+// OnCreateExtensionTask adds task-removal control to ExtensionTask.
+// Delete is intentionally only exposed to onCreate handlers, so an extension can
+// discard a task before it starts downloading (e.g. the file already exists locally).
+type OnCreateExtensionTask struct {
 	download *Downloader
 
 	*ExtensionTask
@@ -753,6 +830,13 @@ func newOnErrorExtensionTask(download *Downloader, task *Task) *OnErrorExtension
 	}
 }
 
+func newOnCreateExtensionTask(download *Downloader, task *Task) *OnCreateExtensionTask {
+	return &OnCreateExtensionTask{
+		download:      download,
+		ExtensionTask: newExtensionTask(task),
+	}
+}
+
 func newOnDoneExtensionTask(task *Task) *Task {
 	return cloneExtensionTask(task)
 }
@@ -766,6 +850,33 @@ func (t *OnErrorExtensionTask) Continue() error {
 	return t.download.Continue(&TaskFilter{
 		IDs: []string{t.ID},
 	})
+}
+
+func (t *OnCreateExtensionTask) Delete(force bool) error {
+	return t.download.Delete(&TaskFilter{
+		IDs: []string{t.ID},
+	}, force)
+}
+
+func (t *ExtensionTask) FolderPath() string {
+	if t.Meta == nil || t.Meta.Res == nil {
+		return ""
+	}
+	return t.Meta.FolderPath()
+}
+
+func (t *ExtensionTask) SingleFilepath() string {
+	if t.Meta == nil || t.Meta.Res == nil || len(t.Meta.Res.Files) == 0 {
+		return ""
+	}
+	return t.Meta.SingleFilepath()
+}
+
+func (t *ExtensionTask) RootDirPath() string {
+	if t.Meta == nil {
+		return ""
+	}
+	return t.Meta.RootDirPath()
 }
 
 func parseSettings(settings []*Setting) map[string]any {

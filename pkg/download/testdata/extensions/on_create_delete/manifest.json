@@ -1,0 +1,16 @@
+{
+  "name": "on-create-delete",
+  "title": "gopeed extension on create event delete test",
+  "version": "0.0.1",
+  "scripts": [
+    {
+      "event": "onCreate",
+      "match": {
+        "labels": [
+          "skip"
+        ]
+      },
+      "entry": "index.js"
+    }
+  ]
+}

@@ -106,6 +106,9 @@ type Downloader struct {
 	fetcherMapLock     *sync.RWMutex
 	checkDuplicateLock *sync.Mutex
 	closed             atomic.Bool
+	// taskHandlers counts the background start/pause handlers in flight, Close waits
+	// for them so that their storage writes land before the storage is closed.
+	taskHandlers atomic.Int64
 
 	// claimedExtractions tracks which multi-part archives have been claimed for extraction
 	// Key: fullBaseName (e.g., "/path/archive.7z"), Value: taskID that claimed it
@@ -222,9 +225,15 @@ func (d *Downloader) Setup() error {
 
 	// handle upload
 	go func() {
-		for _, task := range d.tasks {
+		for _, task := range d.GetTasks() {
 			if task.Status == base.DownloadStatusDone && task.Uploading {
-				if err := d.restoreTask(task); err != nil {
+				err := func() error {
+					task.statusLock.Lock()
+					defer task.statusLock.Unlock()
+
+					return d.restoreTask(task)
+				}()
+				if err != nil {
 					d.Logger.Error().Stack().Err(err).Msgf("task upload restore fetcher failed, task id: %s", task.ID)
 				}
 				if uploader, ok := task.fetcher.(fetcher.Uploader); ok {
@@ -239,53 +248,47 @@ func (d *Downloader) Setup() error {
 	// calculate download speed every tick
 	go func() {
 		for !d.closed.Load() {
-			if len(d.tasks) > 0 {
-				for _, task := range d.tasks {
-					func() {
-						// Do not acquire d.lock (via GetTask) while holding
-						// statusLock; scheduling uses the opposite lock order.
-						if d.GetTask(task.ID) == nil {
-							return
-						}
-						task.statusLock.Lock()
-						if task.Status != base.DownloadStatusRunning && !task.Uploading {
-							task.statusLock.Unlock()
-							return
-						}
-						if task.fetcher == nil {
-							task.statusLock.Unlock()
-							return
-						}
-
-						current := task.fetcher.Progress().TotalDownloaded()
-						tick := float64(d.cfg.RefreshInterval) / 1000
-						downloadDataChanged := false
-						if task.Status == base.DownloadStatusRunning {
-							downloadDataChanged = current != task.Progress.Downloaded
-							task.Progress.Used = task.timer.Used()
-							task.Progress.Speed = task.updateSpeed(current-task.Progress.Downloaded, tick)
-							task.Progress.Downloaded = current
-						}
-
-						uploadDataChanged := false
-						if task.Uploading {
-							uploader := task.fetcher.(fetcher.Uploader)
-							currentUploaded := uploader.UploadedBytes()
-							uploadDataChanged = currentUploaded != task.Progress.Uploaded
-							task.Progress.UploadSpeed = task.updateUploadSpeed(currentUploaded-task.Progress.Uploaded, tick)
-							task.Progress.Uploaded = currentUploaded
-						}
+			for _, task := range d.GetTasks() {
+				func() {
+					task.statusLock.Lock()
+					if task.Status != base.DownloadStatusRunning && !task.Uploading {
 						task.statusLock.Unlock()
-						// Listener callbacks may Pause/Continue and acquire statusLock.
-						d.emit(EventKeyProgress, task)
+						return
+					}
+					// check if task is deleted
+					if task.isDeleted() || task.fetcher == nil {
+						task.statusLock.Unlock()
+						return
+					}
 
-						// store fetcher progress when download/upload data changed
-						if !downloadDataChanged && !uploadDataChanged {
-							return
-						}
-						d.saveTask(task)
-					}()
-				}
+					current := task.fetcher.Progress().TotalDownloaded()
+					tick := float64(d.cfg.RefreshInterval) / 1000
+					downloadDataChanged := false
+					if task.Status == base.DownloadStatusRunning {
+						downloadDataChanged = current != task.Progress.Downloaded
+						task.Progress.Used = task.timer.Used()
+						task.Progress.Speed = task.updateSpeed(current-task.Progress.Downloaded, tick)
+						task.Progress.Downloaded = current
+					}
+
+					uploadDataChanged := false
+					if task.Uploading {
+						uploader := task.fetcher.(fetcher.Uploader)
+						currentUploaded := uploader.UploadedBytes()
+						uploadDataChanged = currentUploaded != task.Progress.Uploaded
+						task.Progress.UploadSpeed = task.updateUploadSpeed(currentUploaded-task.Progress.Uploaded, tick)
+						task.Progress.Uploaded = currentUploaded
+					}
+					task.statusLock.Unlock()
+					// Listener callbacks may Pause/Continue and acquire statusLock.
+					d.emit(EventKeyProgress, task)
+
+					// store fetcher progress when download/upload data changed
+					if !downloadDataChanged && !uploadDataChanged {
+						return
+					}
+					d.saveTask(task)
+				}()
 			}
 			time.Sleep(time.Millisecond * time.Duration(d.cfg.RefreshInterval))
 		}
@@ -377,11 +380,31 @@ func (d *Downloader) setupFetcher(fm fetcher.FetcherManager, fetcher fetcher.Fet
 	fetcher.Setup(ctl)
 }
 
+// putTask persists the task info, it's a no-op when the task has already been deleted.
+// All task info writes must go through here, a write that races with a delete would
+// otherwise bring the task back on the next startup.
+func (d *Downloader) putTask(task *Task) error {
+	unlock := task.lockPersist()
+	defer unlock()
+
+	if task.isDeleted() {
+		return nil
+	}
+	return d.storage.Put(bucketTask, task.ID, task.clone())
+}
+
 func (d *Downloader) saveTask(task *Task) error {
 	data, err := task.fetcherManager.Store(task.fetcher)
 	if err != nil {
 		d.Logger.Error().Stack().Err(err).Msgf("serialize fetcher failed: %s", task.ID)
 		return err
+	}
+
+	unlock := task.lockPersist()
+	defer unlock()
+
+	if task.isDeleted() {
+		return nil
 	}
 	if data != nil {
 		if err := d.storage.Put(bucketSave, task.ID, data); err != nil {
@@ -394,7 +417,7 @@ func (d *Downloader) saveTask(task *Task) error {
 			return err
 		}
 	}
-	if err := d.storage.Put(bucketTask, task.ID, task); err != nil {
+	if err := d.storage.Put(bucketTask, task.ID, task.clone()); err != nil {
 		d.Logger.Error().Stack().Err(err).Msgf("persist task failed: %s", task.ID)
 		return err
 	}
@@ -607,15 +630,22 @@ func (d *Downloader) Pause(filter *TaskFilter) (err error) {
 }
 
 func (d *Downloader) pauseAll() (err error) {
+	var pauseTasks []*Task
 	func() {
 		d.lock.Lock()
 		defer d.lock.Unlock()
 
 		// Clear wait tasks
 		d.waitTasks = d.waitTasks[:0]
+		pauseTasks = d.snapshotTasks()
 	}()
 
-	for _, task := range d.tasks {
+	for _, task := range pauseTasks {
+		// A task that is still inside doCreate isn't owned by us yet, pausing it here
+		// would race with the creation flow.
+		if task.isCreating() {
+			continue
+		}
 		if err = d.doPause(task); err != nil {
 			return
 		}
@@ -671,7 +701,7 @@ func (d *Downloader) Continue(filter *TaskFilter) (err error) {
 			if len(realContinueTasks) < needRunningCount {
 				realContinueTasks = append(realContinueTasks, task)
 			} else {
-				task.Status = base.DownloadStatusWait
+				d.setStatus(task, base.DownloadStatusWait)
 				d.waitTasks = append(d.waitTasks, task)
 			}
 		}
@@ -704,11 +734,15 @@ func (d *Downloader) continueAll() (err error) {
 		// calculate how many tasks can be continued, can't exceed maxRunning
 		remainCount := d.remainRunningCount()
 		for _, task := range d.tasks {
+			// Skip tasks that are still being created, doCreate starts them itself.
+			if task.isCreating() {
+				continue
+			}
 			if task.Status != base.DownloadStatusRunning && task.Status != base.DownloadStatusDone {
 				if len(continuedTasks) < remainCount {
 					continuedTasks = append(continuedTasks, task)
 				} else {
-					task.Status = base.DownloadStatusWait
+					d.setStatus(task, base.DownloadStatusWait)
 					d.waitTasks = append(d.waitTasks, task)
 				}
 			}
@@ -829,10 +863,20 @@ func (d *Downloader) Stats(id string) (sr any, err error) {
 func (d *Downloader) doDelete(task *Task, force bool) (err error) {
 	defer d.releaseBlobTask(task)
 	err = func() error {
-		if err := d.storage.Delete(bucketTask, task.ID); err != nil {
-			return err
-		}
-		if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+		// Flag the task as deleted and purge it from storage atomically, so that a
+		// concurrent putTask/saveTask either happens fully before the purge or is
+		// skipped entirely. Extensions delete tasks from the onCreate/onStart events
+		// while other goroutines may still be persisting them.
+		if err := func() error {
+			unlock := task.lockPersist()
+			defer unlock()
+
+			task.markDeleted()
+			if err := d.storage.Delete(bucketTask, task.ID); err != nil {
+				return err
+			}
+			return d.storage.Delete(bucketSave, task.ID)
+		}(); err != nil {
 			return err
 		}
 
@@ -868,6 +912,9 @@ func (d *Downloader) Close() error {
 
 	closeArr := []func() error{
 		d.pauseAll,
+		// pauseAll persists the paused state from background handlers, wait for them
+		// before closing the storage, otherwise the state is silently lost.
+		d.waitTaskHandlers,
 	}
 	for _, fm := range d.cfg.FetchManagers {
 		closeArr = append(closeArr, fm.Close)
@@ -885,6 +932,20 @@ func (d *Downloader) Close() error {
 		}
 	}
 	return lastErr
+}
+
+// waitTaskHandlers waits for the background start/pause handlers to finish, bounded so
+// that a stuck fetcher can never block shutdown forever.
+func (d *Downloader) waitTaskHandlers() error {
+	deadline := time.Now().Add(time.Second * 5)
+	for d.taskHandlers.Load() > 0 {
+		if time.Now().After(deadline) {
+			d.Logger.Warn().Msg("timeout waiting for task handlers to finish")
+			break
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	return nil
 }
 
 func (d *Downloader) Clear() error {
@@ -955,7 +1016,15 @@ func (d *Downloader) GetTasks() []*Task {
 	d.lock.Lock()
 	defer d.lock.Unlock()
 
-	return d.tasks
+	return d.snapshotTasks()
+}
+
+// snapshotTasks copies the task list, callers must hold d.lock. Delete rewrites
+// d.tasks in place, so the slice must never escape the lock.
+func (d *Downloader) snapshotTasks() []*Task {
+	tasks := make([]*Task, len(d.tasks))
+	copy(tasks, d.tasks)
+	return tasks
 }
 
 // GetTasksByFilter get tasks by filter, if filter is nil, return all tasks
@@ -965,7 +1034,7 @@ func (d *Downloader) GetTasksByFilter(filter *TaskFilter) []*Task {
 	defer d.lock.Unlock()
 
 	if filter == nil || filter.IsEmpty() {
-		return d.tasks
+		return d.snapshotTasks()
 	}
 
 	idMatch := func(task *Task) bool {
@@ -1056,7 +1125,7 @@ func (d *Downloader) watch(task *Task) {
 				// Check if the task is deleted
 				if d.GetTask(task.ID) != nil {
 					task.Uploading = false
-					d.storage.Put(bucketTask, task.ID, task.clone())
+					d.putTask(task)
 				}
 			}()
 		}
@@ -1089,7 +1158,7 @@ func (d *Downloader) watch(task *Task) {
 		}
 
 		// When delete a not resolved task, need check if the task resource is nil
-		if task.Meta.Res == nil || d.GetTask(task.ID) == nil {
+		if task.Meta.Res == nil || task.isDeleted() || d.GetTask(task.ID) == nil {
 			return
 		}
 		if d.blob != nil && task.Meta.Req != nil {
@@ -1116,7 +1185,7 @@ func (d *Downloader) watch(task *Task) {
 		if !d.markTaskDone(task) {
 			return
 		}
-		d.storage.Put(bucketTask, task.ID, task.clone())
+		d.putTask(task)
 		d.emit(EventKeyDone, task)
 		d.emit(EventKeyFinally, task, err)
 		d.notifyRunning()
@@ -1281,9 +1350,18 @@ func (d *Downloader) restoreTask(task *Task) error {
 func (d *Downloader) restoreFetcher(task *Task) error {
 	v, f := task.fetcherManager.Restore()
 	if v != nil {
-		err := d.storage.Pop(bucketSave, task.ID, v)
+		// Get + Delete instead of Pop, we need to know whether progress was actually
+		// persisted: without it the task restarts from scratch and must not be allowed
+		// to write into a file it may not own, see doStart.
+		exist, err := d.storage.Get(bucketSave, task.ID, v)
 		if err != nil {
 			return err
+		}
+		if exist {
+			task.resumable = true
+			if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+				return err
+			}
 		}
 	}
 	task.fetcher = f(task.Meta, v)
@@ -1329,7 +1407,31 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 			d.releaseBlobTask(task)
 		}
 	}()
-	if err = d.storage.Put(bucketTask, task.ID, task.clone()); err != nil {
+
+	// The task has to be published before the onCreate event so that extensions can
+	// delete it from the event handler, but it isn't persisted or owned by the
+	// pause/continue flows until the event has been handled.
+	func() {
+		task.markCreating(true)
+		defer task.markCreating(false)
+
+		func() {
+			d.lock.Lock()
+			defer d.lock.Unlock()
+
+			d.tasks = append(d.tasks, task)
+		}()
+
+		d.triggerOnCreate(task)
+	}()
+
+	// The onCreate event may have deleted the task (doDelete releases the blob lease).
+	if task.isDeleted() || d.GetTask(task.ID) == nil {
+		d.Logger.Debug().Msgf("task deleted in onCreate event, task id: %s", task.ID)
+		return
+	}
+
+	if err = d.putTask(task); err != nil {
 		return
 	}
 	taskId = task.ID
@@ -1338,11 +1440,9 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 		d.lock.Lock()
 		defer d.lock.Unlock()
 
-		d.tasks = append(d.tasks, task)
-
 		remainRunningCount := d.remainRunningCount()
 		if remainRunningCount == 0 {
-			task.Status = base.DownloadStatusWait
+			d.setStatus(task, base.DownloadStatusWait)
 			d.waitTasks = append(d.waitTasks, task)
 			return
 		}
@@ -1393,10 +1493,23 @@ func (d *Downloader) statusMut(task *Task, fn func() (bool, error)) (bool, error
 	return fn()
 }
 
+// setStatus updates the task status under its status lock, the progress ticker reads
+// the status under the same lock.
+func (d *Downloader) setStatus(task *Task, status base.Status) {
+	d.statusMut(task, func() (bool, error) {
+		task.updateStatus(status)
+		return false, nil
+	})
+}
+
 func (d *Downloader) doStart(task *Task) (err error) {
 	var isCreate bool
 	var generation uint64
 	isReturn, err := d.statusMut(task, func() (isReturn bool, err error) {
+		if task.isDeleted() {
+			isReturn = true
+			return
+		}
 		if task.Status == base.DownloadStatusRunning || task.Status == base.DownloadStatusDone {
 			isReturn = true
 			return
@@ -1408,6 +1521,14 @@ func (d *Downloader) doStart(task *Task) (err error) {
 			return
 		}
 		isCreate = task.Status == base.DownloadStatusReady
+		// A task restored from storage that never downloaded a single byte and has no
+		// persisted fetcher progress starts over from zero. Treating it as a resume
+		// would skip the duplicate check below and let it write into a pre-existing
+		// file that it does not own, corrupting it. Treat it as a fresh task instead.
+		if !isCreate && !task.started && !task.resumable && task.Progress.Downloaded == 0 {
+			isCreate = true
+		}
+		task.started = true
 		task.updateStatus(base.DownloadStatusRunning)
 		task.runGeneration++
 		generation = task.runGeneration
@@ -1436,6 +1557,10 @@ func (d *Downloader) doStart(task *Task) (err error) {
 			}
 		}
 		d.triggerOnStart(task)
+		// Check if the task was deleted in the onStart event
+		if task.isDeleted() || d.GetTask(task.ID) == nil {
+			return nil
+		}
 		if !d.taskIsRunningGeneration(task, generation) {
 			return nil
 		}
@@ -1453,6 +1578,12 @@ func (d *Downloader) doStart(task *Task) (err error) {
 				return err
 			}
 			task.Meta.Res = task.fetcher.Meta().Res
+		}
+
+		// Resolve can take a while, make sure the task wasn't deleted meanwhile,
+		// otherwise it would start writing to disk and be persisted again.
+		if task.isDeleted() || d.GetTask(task.ID) == nil {
+			return nil
 		}
 
 		if isCreate {
@@ -1481,6 +1612,14 @@ func (d *Downloader) doStart(task *Task) (err error) {
 			}
 
 			task.Meta.Res.CalcSize(task.Meta.Opts.SelectFiles)
+
+			// Persist the resolved (possibly renamed) meta before the fetcher starts
+			// writing to disk. A crash after Start would otherwise leave a stored task
+			// record that still points at the old file name, and the restarted task
+			// would resume into a file it does not own.
+			if err := d.putTask(task); err != nil {
+				return err
+			}
 		}
 
 		task.Progress.Speed = 0
@@ -1497,7 +1636,10 @@ func (d *Downloader) doStart(task *Task) (err error) {
 		}
 		return nil
 	}
+	d.taskHandlers.Add(1)
 	go func() {
+		defer d.taskHandlers.Add(-1)
+
 		if err := handler(); err != nil {
 			if d.taskIsRunningGeneration(task, generation) {
 				d.doOnError(task, err)
@@ -1587,7 +1729,7 @@ func (d *Downloader) runPauseHandler(task *Task, generation uint64, pauseFetcher
 			return false, err
 		}
 	} else {
-		if err := d.storage.Put(bucketTask, task.ID, task.clone()); err != nil {
+		if err := d.putTask(task); err != nil {
 			return false, err
 		}
 	}
@@ -1702,7 +1844,7 @@ func (d *Downloader) enqueueSingleExtraction(task *Task, downloadFilePath string
 	// Set extraction status to queued
 	task.Progress.ExtractStatus = ExtractStatusQueued
 	d.emit(EventKeyProgress, task)
-	d.storage.Put(bucketTask, task.ID, task.clone())
+	d.putTask(task)
 	d.Logger.Info().Msgf("extraction queued, task id: %s, job id: %s", task.ID, jobID)
 
 	// Create and enqueue the extraction job
@@ -1731,7 +1873,7 @@ func (d *Downloader) enqueueMultiPartExtraction(task *Task, downloadFilePath str
 		// Not all parts are ready yet - just set status to waiting, don't queue anything
 		task.Progress.ExtractStatus = ExtractStatusWaitingParts
 		d.emit(EventKeyProgress, task)
-		d.storage.Put(bucketTask, task.ID, task.clone())
+		d.putTask(task)
 		d.Logger.Info().Msgf("multi-part archive waiting for other parts, task id: %s, missing: %v", task.ID, missingParts)
 		return
 	}
@@ -1747,14 +1889,14 @@ func (d *Downloader) enqueueMultiPartExtraction(task *Task, downloadFilePath str
 		task.Progress.ExtractStatus = ExtractStatusDone
 		task.Progress.ExtractProgress = 100
 		d.emit(EventKeyProgress, task)
-		d.storage.Put(bucketTask, task.ID, task.clone())
+		d.putTask(task)
 		d.Logger.Info().Msgf("multi-part archive extraction already handled by another part, task id: %s", task.ID)
 		return
 	}
 
 	// This task claimed the extraction - status already set to queued in tryClaimMultiPartExtraction
 	d.emit(EventKeyProgress, task)
-	d.storage.Put(bucketTask, task.ID, task.clone())
+	d.putTask(task)
 
 	jobID := "multipart:" + fullBaseName
 	d.Logger.Info().Msgf("multi-part extraction queued, task id: %s, job id: %s", task.ID, jobID)
@@ -1843,7 +1985,7 @@ func (d *Downloader) performExtraction(task *Task, archivePath string, destDir s
 	task.Progress.ExtractStatus = ExtractStatusExtracting
 	task.Progress.ExtractProgress = 0
 	d.emit(EventKeyProgress, task)
-	d.storage.Put(bucketTask, task.ID, task.clone())
+	d.putTask(task)
 
 	// Extract the archive
 	extractErr := extractArchive(archivePath, destDir, opts.ArchivePassword, func(extractedFiles int, totalFiles int, progress int) {
@@ -1863,7 +2005,7 @@ func (d *Downloader) performMultiPartExtraction(task *Task, firstPartPath string
 	task.Progress.ExtractStatus = ExtractStatusExtracting
 	task.Progress.ExtractProgress = 0
 	d.emit(EventKeyProgress, task)
-	d.storage.Put(bucketTask, task.ID, task.clone())
+	d.putTask(task)
 
 	d.Logger.Info().Msgf("starting multi-part archive extraction, first part: %s, task id: %s", firstPartPath, task.ID)
 
@@ -2007,13 +2149,13 @@ func (d *Downloader) handleExtractionResult(task *Task, extractErr error, archiv
 		d.Logger.Error().Err(extractErr).Msgf("auto extract archive failed, task id: %s", task.ID)
 		task.Progress.ExtractStatus = ExtractStatusError
 		d.emit(EventKeyProgress, task)
-		d.storage.Put(bucketTask, task.ID, task.clone())
+		d.putTask(task)
 	} else {
 		d.Logger.Info().Msgf("auto extract archive completed, task id: %s", task.ID)
 		task.Progress.ExtractStatus = ExtractStatusDone
 		task.Progress.ExtractProgress = 100
 		d.emit(EventKeyProgress, task)
-		d.storage.Put(bucketTask, task.ID, task.clone())
+		d.putTask(task)
 
 		// Delete archive files after successful extraction if enabled
 		if deleteAfterExtract {
@@ -2053,7 +2195,7 @@ func (d *Downloader) updateMultiPartTasksStatus(sourceTask *Task, extractErr err
 			task.Progress.ExtractStatus = status
 			task.Progress.ExtractProgress = progress
 			d.emit(EventKeyProgress, task)
-			d.storage.Put(bucketTask, task.ID, task.clone())
+			d.putTask(task)
 		}
 	}
 }
@@ -2063,6 +2205,9 @@ func initTask(task *Task) {
 
 	task.statusLock = &sync.Mutex{}
 	task.lock = &sync.Mutex{}
+	task.persistLock = &sync.Mutex{}
+	task.deleted = &atomic.Bool{}
+	task.creating = &atomic.Bool{}
 	task.blobRefLock = &sync.Mutex{}
 	task.speedArr = make([]int64, 0)
 	task.uploadSpeedArr = make([]int64, 0)
