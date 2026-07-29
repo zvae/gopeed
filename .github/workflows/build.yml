@@ -3,6 +3,10 @@ name: build
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: "Release tag used for build artifacts"
+        required: true
+        default: "v0.0.0-dev"
       platform:
         description: "Build platform"
         required: true
@@ -29,10 +33,29 @@ jobs:
       upload_url: ${{ steps.get-release.outputs.upload_url }}
 
     steps:
-      - uses: monkeyWie/get-latest-release@v2.1
+      - name: Get release
+        uses: actions/github-script@v8
         id: get-release
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         with:
-          myToken: ${{ github.token }}
+          github-token: ${{ github.token }}
+          script: |
+            const tag = process.env.RELEASE_TAG.trim();
+            if (!tag) {
+              core.setFailed("release_tag must not be empty");
+              return;
+            }
+
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag,
+            });
+            core.info(`Using release ${tag}`);
+
+            core.setOutput("version", tag.replace(/^v/, ""));
+            core.setOutput("upload_url", release.data.upload_url);
 
   build-windows:
     if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows' }}
@@ -406,7 +429,8 @@ jobs:
           asset_path: ui/flutter/dist/*/*
           overwrite: true
   build-snap:
-    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'snap' }}
+    # Temporarily disabled until Snap Store credentials are configured.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     needs: [get-release]
     steps:
@@ -542,7 +566,8 @@ jobs:
           export SNAPCRAFT_STORE_CREDENTIALS=${{ secrets.SNAP_STORE_LOGIN }}
           snapcraft upload --release=${{ github.event.inputs.test == 'true' && 'edge' || 'stable' }} gopeed_${VERSION}_amd64.snap
   build-android:
-    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'android' }}
+    # Temporarily disabled until APK signing credentials are configured.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     needs: [get-release]
     steps:
@@ -726,7 +751,8 @@ jobs:
           asset_path: dist/qnap/*
           overwrite: true
   build-docker:
-    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'docker' }}
+    # Temporarily disabled until Docker Hub credentials are configured.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     needs: [get-release]
     steps:

@@ -1,0 +1,80 @@
+name: create release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create or reuse"
+        required: true
+        default: "v0.0.0-dev"
+      trigger_build:
+        description: "Trigger the build workflow after creating the release"
+        required: true
+        type: boolean
+        default: true
+  push:
+    branches:
+      - dev
+    paths:
+      - ".github/workflows/create-release.yml"
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release and trigger build
+        uses: actions/github-script@v8
+        env:
+          BUILD_REF: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.0.0-dev' }}
+          TRIGGER_BUILD: ${{ github.event_name == 'push' || inputs.trigger_build }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const tag = process.env.RELEASE_TAG.trim();
+            if (!tag) {
+              core.setFailed("release_tag must not be empty");
+              return;
+            }
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              core.info(`Using existing release ${tag}`);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                target_commitish: process.env.BUILD_REF,
+                name: tag,
+                draft: false,
+                prerelease: true,
+              });
+              core.info(`Created prerelease ${tag}`);
+            }
+
+            if (process.env.TRIGGER_BUILD === "true") {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: "build.yml",
+                ref: process.env.BUILD_REF,
+                inputs: {
+                  release_tag: tag,
+                  platform: "all",
+                  test: "true",
+                },
+              });
+              core.info(`Triggered build.yml on ${process.env.BUILD_REF}`);
+            }
